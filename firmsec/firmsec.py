@@ -4,11 +4,12 @@ FirmSec - Firmware Security Analysis Tool for Axis OS Devices
 """
 
 import argparse
+import json
 import os
 import re
+import struct
 import subprocess
 import sys
-import time
 from datetime import datetime
 from pathlib import Path
 
@@ -22,7 +23,6 @@ except ImportError:
 try:
     from rich.console import Console
     from rich.table import Table
-    from rich.progress import Progress, SpinnerColumn, TextColumn
     from rich.panel import Panel
     from rich.tree import Tree
     HAS_RICH = True
@@ -40,64 +40,114 @@ LOW      = "LOW"
 
 SEVERITY_ORDER = {CRITICAL: 0, HIGH: 1, MEDIUM: 2, LOW: 3}
 
+# ── ELF machine type → architecture name ────────────────────────────────────
+
+ELF_MACHINES = {
+    0x03: "x86",
+    0x08: "MIPS",
+    0x14: "PowerPC",
+    0x28: "ARM",
+    0x3E: "x86-64",
+    0xB7: "AArch64",
+    0xF3: "RISC-V",
+}
+
 # ── Dangerous function definitions ────────────────────────────────────────────
 
 DANGEROUS_FUNCTIONS = {
-    "system":   (HIGH,   "Shell command execution; user input may reach shell"),
-    "popen":    (HIGH,   "Pipe to shell; command injection risk"),
-    "strcpy":   (HIGH,   "Unbounded copy; classic stack overflow vector"),
-    "sprintf":  (MEDIUM, "Unbounded format write; potential buffer overflow"),
-    "gets":     (CRITICAL,"Always unsafe; removed from C11"),
-    "memcpy":   (LOW,    "Length must be validated by caller"),
-    "strcat":   (HIGH,   "Unbounded concatenation; buffer overflow risk"),
-    "scanf":    (MEDIUM, "Unbounded input; format string risk"),
-    "vsprintf": (MEDIUM, "Unbounded variadic format write"),
-    "bcopy":    (LOW,    "Deprecated; prefer memmove"),
+    "system":   (HIGH,     "Shell command execution; user input may reach shell"),
+    "popen":    (HIGH,     "Pipe to shell; command injection risk"),
+    "strcpy":   (HIGH,     "Unbounded copy; classic stack overflow vector"),
+    "strcat":   (HIGH,     "Unbounded concatenation; buffer overflow risk"),
+    "sprintf":  (MEDIUM,   "Unbounded format write; potential buffer overflow"),
+    "vsprintf": (MEDIUM,   "Unbounded variadic format write"),
+    "gets":     (CRITICAL, "Always unsafe; removed from C11"),
+    "scanf":    (MEDIUM,   "Unbounded input; format string risk"),
+    "memcpy":   (LOW,      "Length must be validated by caller"),
+    "bcopy":    (LOW,      "Deprecated; prefer memmove"),
+    "printf":   (MEDIUM,   "Verify format string is not user-controlled"),
+    "exec":     (HIGH,     "Process execution; argument injection risk"),
 }
 
 # ── Credential patterns ───────────────────────────────────────────────────────
 
 CRED_PATTERNS = [
-    (r'password\s*=\s*\S+',  CRITICAL, "Hardcoded password"),
-    (r'passwd\s*=\s*\S+',    CRITICAL, "Hardcoded passwd field"),
-    (r'secret\s*=\s*\S+',    CRITICAL, "Hardcoded secret"),
-    (r'admin\s*=\s*\S+',     HIGH,     "Hardcoded admin value"),
-    (r'root\s*=\s*\S+',      HIGH,     "Hardcoded root value"),
-    (r'api_key\s*=\s*\S+',   CRITICAL, "Hardcoded API key"),
-    (r'token\s*=\s*\S+',     HIGH,     "Hardcoded token"),
-    (r'private_key\s*=\s*\S+', CRITICAL, "Hardcoded private key reference"),
+    (r'password\s*[=:]\s*\S+',     CRITICAL, "Hardcoded password"),
+    (r'passwd\s*[=:]\s*\S+',       CRITICAL, "Hardcoded passwd field"),
+    (r'secret\s*[=:]\s*\S+',       CRITICAL, "Hardcoded secret"),
+    (r'api[_-]?key\s*[=:]\s*\S+',  CRITICAL, "Hardcoded API key"),
+    (r'private[_-]?key\s*[=:]\s*\S+', CRITICAL, "Hardcoded private key reference"),
+    (r'admin\s*[=:]\s*\S+',        HIGH,     "Hardcoded admin value"),
+    (r'root\s*[=:]\s*\S+',         HIGH,     "Hardcoded root value"),
+    (r'token\s*[=:]\s*\S+',        HIGH,     "Hardcoded token"),
+    (r'auth\s*[=:]\s*\S+',         MEDIUM,   "Hardcoded auth value"),
+    (r'username\s*[=:]\s*\S+',     MEDIUM,   "Hardcoded username"),
+]
+
+CRED_FILE_EXTS = [
+    "*.conf", "*.xml", "*.txt", "*.cfg", "*.ini",
+    "*.json", "*.yaml", "*.yml", "*.env",
+    "*.js",   "*.html","*.php", "*.sh",  "*.py",
+    "*.properties", "*.toml",
 ]
 
 # ── Vulnerable library signatures ─────────────────────────────────────────────
 
 VULNERABLE_LIBS = {
     "openssl":  {
-        "pattern": r'openssl[\s/\-_]*([\d]+\.[\d]+\.[\d]+[a-z]?)',
-        "cves": ["CVE-2014-0160 (Heartbleed, <1.0.1g)", "CVE-2022-0778 (<1.0.2zd,<1.1.1n,<3.0.2)"],
+        "pattern": r'(?:openssl|OpenSSL)[/ \-_v]*([\d]+\.[\d]+\.[\d]+[a-z]?)',
+        "cves": [
+            "CVE-2014-0160 (Heartbleed, <1.0.1g)",
+            "CVE-2016-2107 (padding oracle, <1.0.1t/<1.0.2h)",
+            "CVE-2022-0778 (<1.0.2zd,<1.1.1n,<3.0.2)",
+        ],
     },
-    "libupnp":  {
-        "pattern": r'libupnp[\s/\-_]*([\d]+\.[\d]+\.[\d]+)',
-        "cves": ["CVE-2012-5958 (≤1.6.17 stack overflow)", "CVE-2016-8863 (≤1.6.20 heap overflow)"],
+    "libupnp": {
+        "pattern": r'libupnp[/ \-_v]*([\d]+\.[\d]+\.[\d]+)',
+        "cves": [
+            "CVE-2012-5958 (≤1.6.17 stack overflow)",
+            "CVE-2016-8863 (≤1.6.20 heap overflow)",
+        ],
     },
-    "boa":      {
-        "pattern": r'boa[\s/\-_]*([\d]+\.[\d]+\.[\d]+)',
-        "cves": ["CVE-2017-9833 (dir traversal)", "CVE-2021-33558 (info disclosure)"],
+    "boa": {
+        "pattern": r'boa[/ \-_v]*([\d]+\.[\d]+\.[\d]+)',
+        "cves": [
+            "CVE-2017-9833 (directory traversal)",
+            "CVE-2021-33558 (information disclosure)",
+        ],
     },
-    "thttpd":   {
-        "pattern": r'thttpd[\s/\-_]*([\d]+\.[\d]+\.[\d]+)',
-        "cves": ["CVE-2017-11549 (null ptr deref)", "CVE-2022-38723 (buffer overflow)"],
+    "thttpd": {
+        "pattern": r'thttpd[/ \-_v]*([\d]+\.[\d]+\.[\d]+)',
+        "cves": [
+            "CVE-2017-11549 (null pointer dereference)",
+            "CVE-2022-38723 (buffer overflow)",
+        ],
     },
-    "busybox":  {
-        "pattern": r'busybox[\s/\-_v]*([\d]+\.[\d]+\.[\d]+)',
-        "cves": ["CVE-2022-28391 (shell cmd injection in hush)", "CVE-2021-42374 (lzma OOB read)"],
+    "busybox": {
+        "pattern": r'[Bb]usyBox[/ \-_v]*([\d]+\.[\d]+\.[\d]+)',
+        "cves": [
+            "CVE-2021-42374 (lzma OOB read)",
+            "CVE-2022-28391 (hush shell command injection)",
+        ],
     },
-    "curl":     {
-        "pattern": r'curl[\s/\-_]*([\d]+\.[\d]+\.[\d]+)',
+    "curl": {
+        "pattern": r'curl[/ \-_v]*([\d]+\.[\d]+\.[\d]+)',
         "cves": ["CVE-2023-38545 (SOCKS5 heap overflow, <8.4.0)"],
+    },
+    "dropbear": {
+        "pattern": r'[Dd]ropbear[/ \-_v]*([\d]+\.[\d]+)',
+        "cves": [
+            "CVE-2016-7406 (format string via username, <2016.74)",
+            "CVE-2017-9078 (use-after-free, <2017.75)",
+        ],
+    },
+    "zlib": {
+        "pattern": r'zlib[/ \-_v]*([\d]+\.[\d]+\.[\d]+)',
+        "cves": ["CVE-2022-37434 (heap buffer overflow via inflateGetHeader, <1.2.13)"],
     },
 }
 
-# ── VAPIX unauthenticated endpoint patterns ───────────────────────────────────
+# ── VAPIX / axis-cgi patterns ─────────────────────────────────────────────────
 
 VAPIX_UNAUTH_PATTERNS = [
     r'/axis-cgi/jpg/image\.cgi',
@@ -112,14 +162,58 @@ VAPIX_UNAUTH_PATTERNS = [
     r'/axis-cgi/firmwareupgrade\.cgi',
     r'/axis-cgi/restart\.cgi',
     r'/axis-cgi/factorydefault\.cgi',
+    r'/axis-cgi/basicdeviceinfo\.cgi',
 ]
 
-VAPIX_SHELL_RISK_PATTERNS = [
-    r'system\s*\([^)]*param',
-    r'popen\s*\([^)]*param',
-    r'exec\s*\([^)]*param',
-    r'shell_exec.*param',
+# Known default Axis credentials
+AXIS_DEFAULT_CREDS = [
+    ("root",  "pass"),
+    ("root",  "root"),
+    ("admin", "admin"),
+    ("admin", ""),
+    ("root",  ""),
 ]
+
+# ── Credential severity context ───────────────────────────────────────────────
+#
+# CRITICAL: credential is reachable without any authentication
+#   • File lives in a web-served directory (var/www, cgi-bin, html …)
+#     → a single unauthenticated HTTP request retrieves it
+#   • Pattern type is always high-impact regardless of location:
+#     API keys, private key references, secrets
+#
+# HIGH: credential requires firmware image extraction or local filesystem access
+#   • /etc config files, source code, init scripts, binary strings
+#   • Firmware images are often publicly downloadable, so this is still serious,
+#     but the attacker needs the image rather than just an HTTP request
+#
+# Passwords/tokens in non-web paths are downgraded from their base severity
+# to HIGH for this reason.
+
+WEB_ACCESSIBLE_DIRS = {
+    "www", "html", "htdocs", "webroot", "public_html",
+    "cgi-bin", "cgi", "www-data", "web",
+}
+
+ALWAYS_CRITICAL_LABELS = {
+    "Hardcoded API key",
+    "Hardcoded private key reference",
+    "Hardcoded secret",
+}
+
+def is_web_accessible(path: Path) -> bool:
+    """True if any component of the path is a known web-served directory."""
+    return bool({p.lower() for p in path.parts} & WEB_ACCESSIBLE_DIRS)
+
+def credential_severity(base_severity: str, label: str, fpath: Path) -> tuple:
+    """Return (effective_severity, context_note) using location-aware rules."""
+    if label in ALWAYS_CRITICAL_LABELS:
+        return CRITICAL, ""
+    if is_web_accessible(fpath):
+        return CRITICAL, " [web-exposed — retrievable without authentication]"
+    if base_severity == CRITICAL:
+        return HIGH, " [requires firmware image or local filesystem access]"
+    return base_severity, " [requires firmware image or local filesystem access]"
 
 # ── Helper utilities ──────────────────────────────────────────────────────────
 
@@ -128,11 +222,11 @@ def _c(text, color):
         return f"{color}{text}{Style.RESET_ALL}"
     return text
 
-def _ok(msg):    print(_c(f"[+] {msg}", Fore.GREEN if HAS_COLORAMA else ""))
-def _info(msg):  print(_c(f"[*] {msg}", Fore.CYAN if HAS_COLORAMA else ""))
-def _warn(msg):  print(_c(f"[!] {msg}", Fore.YELLOW if HAS_COLORAMA else ""))
-def _err(msg):   print(_c(f"[-] {msg}", Fore.RED if HAS_COLORAMA else ""), file=sys.stderr)
-def _sep():      print(_c("─" * 60, Fore.BLUE if HAS_COLORAMA else ""))
+def _ok(msg):   print(_c(f"[+] {msg}", Fore.GREEN if HAS_COLORAMA else ""))
+def _info(msg): print(_c(f"[*] {msg}", Fore.CYAN if HAS_COLORAMA else ""))
+def _warn(msg): print(_c(f"[!] {msg}", Fore.YELLOW if HAS_COLORAMA else ""))
+def _err(msg):  print(_c(f"[-] {msg}", Fore.RED if HAS_COLORAMA else ""), file=sys.stderr)
+def _sep():     print(_c("─" * 60, Fore.BLUE if HAS_COLORAMA else ""))
 
 def severity_color(sev):
     if not HAS_COLORAMA:
@@ -141,29 +235,23 @@ def severity_color(sev):
     return _c(sev, colors.get(sev, ""))
 
 def check_tool(name, kali=False):
-    """Return tool path or None; print install hint on miss."""
     result = subprocess.run(["which", name], capture_output=True, text=True)
     if result.returncode == 0:
         return result.stdout.strip()
     _warn(f"Tool not found: {name}")
-    if name == "binwalk":
-        if kali:
-            _warn("  Install: sudo apt install binwalk")
-        else:
-            _warn("  Install: brew install binwalk  OR  pip install binwalk")
-    elif name == "file":
-        _warn("  Install: built-in on most Unix systems")
-    elif name == "strings":
-        _warn("  Install: part of binutils (brew install binutils or apt install binutils)")
-    elif name == "readelf":
-        if kali:
-            _warn("  Install: sudo apt install binutils")
-        else:
-            _warn("  Install: brew install binutils  (provides greadelf)")
+    hints = {
+        "binwalk": ("sudo apt install binwalk", "brew install binwalk"),
+        "file":    ("built-in", "built-in"),
+        "strings": ("sudo apt install binutils", "brew install binutils"),
+        "readelf": ("sudo apt install binutils", "brew install binutils  # provides greadelf"),
+        "openssl": ("sudo apt install openssl", "brew install openssl"),
+    }
+    if name in hints:
+        apt_h, brew_h = hints[name]
+        _warn(f"  Kali: {apt_h}  |  Mac: {brew_h}")
     return None
 
 def run_cmd(cmd, timeout=300):
-    """Run a shell command, return (stdout, stderr, returncode)."""
     try:
         r = subprocess.run(
             cmd, shell=True, capture_output=True, text=True,
@@ -175,6 +263,23 @@ def run_cmd(cmd, timeout=300):
         return "", "timeout", 1
     except Exception as e:
         return "", str(e), 1
+
+def read_elf_arch(path: Path) -> str:
+    """Decode CPU architecture directly from ELF header bytes."""
+    try:
+        with open(path, "rb") as f:
+            header = f.read(20)
+        if len(header) < 20 or header[:4] != b'\x7fELF':
+            return "unknown"
+        ei_data = header[5]  # 1=LE, 2=BE
+        e_machine_bytes = header[18:20]
+        if ei_data == 1:
+            e_machine = struct.unpack_from("<H", e_machine_bytes)[0]
+        else:
+            e_machine = struct.unpack_from(">H", e_machine_bytes)[0]
+        return ELF_MACHINES.get(e_machine, f"e_machine=0x{e_machine:02x}")
+    except (IOError, OSError, struct.error):
+        return "unknown"
 
 # ── Step 1: Extraction ────────────────────────────────────────────────────────
 
@@ -192,43 +297,31 @@ def step_extract(target: Path, kali: bool):
     stdout, stderr, rc = run_cmd(f'binwalk -Me "{target}"', timeout=600)
     print(stdout[:4000] if stdout else "")
 
-    # Locate extracted directory (binwalk naming convention)
     parent = target.parent
-    candidates = sorted(parent.glob(f"_{target.name}.extracted"), key=lambda p: p.stat().st_mtime, reverse=True)
+    candidates = sorted(parent.glob(f"_{target.name}.extracted"),
+                        key=lambda p: p.stat().st_mtime, reverse=True)
     if not candidates:
-        # also check current dir
-        candidates = sorted(Path(".").glob(f"_{target.name}.extracted"), key=lambda p: p.stat().st_mtime, reverse=True)
-
+        candidates = sorted(Path(".").glob(f"_{target.name}.extracted"),
+                            key=lambda p: p.stat().st_mtime, reverse=True)
     if not candidates:
-        _warn("Could not find binwalk extraction directory automatically.")
-        _warn("Looking for any .extracted directory near the target...")
-        candidates = sorted(parent.glob("*.extracted"), key=lambda p: p.stat().st_mtime, reverse=True)
-
+        _warn("Scanning for any .extracted directory near the target...")
+        candidates = sorted(parent.glob("*.extracted"),
+                            key=lambda p: p.stat().st_mtime, reverse=True)
     if not candidates:
         _err("Extraction directory not found. Check binwalk output above.")
         sys.exit(1)
 
     extract_dir = candidates[0]
     _ok(f"Extracted to: {extract_dir}")
-
-    # Detect filesystem type
     fs_type = detect_filesystem(extract_dir)
     _info(f"Detected filesystem type: {fs_type}")
-
-    # Print directory tree summary (top 2 levels, max 40 entries)
     print_tree_summary(extract_dir)
-
     return extract_dir, fs_type
 
-def detect_filesystem(extract_dir: Path):
-    for marker in [
-        ("squashfs-root", "SquashFS"),
-        ("cramfs", "CramFS"),
-        ("jffs2", "JFFS2"),
-    ]:
-        if any(extract_dir.rglob(f"*{marker[0]}*")):
-            return marker[1]
-    # check file sizes / structure heuristics
+def detect_filesystem(extract_dir: Path) -> str:
+    for marker, label in [("squashfs-root", "SquashFS"), ("cramfs", "CramFS"), ("jffs2", "JFFS2")]:
+        if any(extract_dir.rglob(f"*{marker}*")):
+            return label
     subdirs = [d.name.lower() for d in extract_dir.iterdir() if d.is_dir()]
     if any("squash" in d for d in subdirs):
         return "SquashFS"
@@ -238,12 +331,12 @@ def print_tree_summary(root: Path):
     _info("Extracted directory tree (top 3 levels):")
     if HAS_RICH:
         tree = Tree(f"[bold]{root.name}[/bold]")
-        _build_rich_tree(tree, root, depth=0, max_depth=3, max_entries=50)
+        _build_rich_tree(tree, root, depth=0, max_depth=3, max_entries=60)
         console.print(tree)
     else:
         count = 0
         for item in sorted(root.rglob("*")):
-            if count > 50:
+            if count > 60:
                 print("  ... (truncated)")
                 break
             depth = len(item.relative_to(root).parts) - 1
@@ -253,26 +346,24 @@ def print_tree_summary(root: Path):
             print(f"  {prefix}{item.name}")
             count += 1
 
-def _build_rich_tree(tree_node, path: Path, depth, max_depth, max_entries, _counter=None):
-    if _counter is None:
-        _counter = [0]
-    if depth >= max_depth or _counter[0] > max_entries:
+def _build_rich_tree(node, path, depth, max_depth, max_entries, _c=[0]):
+    if depth >= max_depth or _c[0] > max_entries:
         return
     try:
         children = sorted(path.iterdir(), key=lambda p: (p.is_file(), p.name))
     except PermissionError:
         return
     for child in children:
-        if _counter[0] > max_entries:
-            tree_node.add("[dim]...[/dim]")
+        if _c[0] > max_entries:
+            node.add("[dim]...[/dim]")
             break
-        _counter[0] += 1
+        _c[0] += 1
         label = f"[bold blue]{child.name}[/bold blue]" if child.is_dir() else child.name
-        branch = tree_node.add(label)
+        branch = node.add(label)
         if child.is_dir():
-            _build_rich_tree(branch, child, depth + 1, max_depth, max_entries, _counter)
+            _build_rich_tree(branch, child, depth + 1, max_depth, max_entries, _c)
 
-# ── Step 2: Static Analysis ───────────────────────────────────────────────────
+# ── Finding class ─────────────────────────────────────────────────────────────
 
 class Finding:
     def __init__(self, category, severity, path, detail, line=None):
@@ -281,11 +372,11 @@ class Finding:
         self.path = str(path)
         self.detail = detail
         self.line = line
-        self.ts = datetime.now().isoformat(timespec="seconds")
 
     def sort_key(self):
         return SEVERITY_ORDER.get(self.severity, 99)
 
+# ── Step 2: Static Analysis ───────────────────────────────────────────────────
 
 def step_analyze(extract_dir: Path, kali: bool):
     _sep()
@@ -293,29 +384,17 @@ def step_analyze(extract_dir: Path, kali: bool):
     _sep()
 
     findings = []
-
-    # 2a. ELF binaries + architecture
     findings += find_elf_binaries(extract_dir, kali)
-
-    # 2b. Dangerous C functions
     findings += grep_dangerous_functions(extract_dir)
-
-    # 2c. Hardcoded credentials
     findings += find_credentials(extract_dir)
-
-    # 2d. CGI + shell scripts
+    findings += find_passwd_shadow(extract_dir)
     findings += find_scripts(extract_dir)
-
-    # 2e. VAPIX endpoints
+    findings += find_init_scripts(extract_dir)
     findings += find_vapix_endpoints(extract_dir)
-
-    # 2f. Private keys / certs
     findings += find_keys_and_certs(extract_dir)
-
-    # 2g. Vulnerable library versions
     findings += detect_vulnerable_libraries(extract_dir)
-
-    # 2h. Axis-specific surface
+    findings += analyze_webserver_configs(extract_dir)
+    findings += find_network_services(extract_dir)
     findings += axis_specific_checks(extract_dir)
 
     _ok(f"Analysis complete. {len(findings)} findings.")
@@ -323,52 +402,57 @@ def step_analyze(extract_dir: Path, kali: bool):
 
 
 def find_elf_binaries(root: Path, kali: bool):
-    _info("Scanning for ELF binaries...")
+    _info("Scanning for ELF binaries and detecting architecture...")
     findings = []
-    file_tool = check_tool("file", kali)
-    readelf = check_tool("readelf", kali) or check_tool("greadelf", kali)
-
     elf_files = []
+
     for p in root.rglob("*"):
-        if p.is_file() and not p.is_symlink():
-            try:
-                with open(p, "rb") as f:
-                    magic = f.read(4)
-                if magic == b'\x7fELF':
-                    elf_files.append(p)
-            except (IOError, OSError):
-                continue
+        if not p.is_file() or p.is_symlink():
+            continue
+        try:
+            with open(p, "rb") as f:
+                magic = f.read(4)
+            if magic == b'\x7fELF':
+                elf_files.append(p)
+        except (IOError, OSError):
+            continue
 
-    archs = set()
+    arch_map: dict[str, list] = {}
     for p in elf_files:
-        if file_tool:
-            out, _, _ = run_cmd(f'file "{p}"')
-            arch = "unknown"
-            for kw in ["MIPS", "ARM", "x86", "x86-64", "PowerPC", "AArch64"]:
-                if kw.lower() in out.lower():
-                    arch = kw
-                    break
-            archs.add(arch)
+        arch = read_elf_arch(p)
+        arch_map.setdefault(arch, []).append(p)
 
-    _ok(f"Found {len(elf_files)} ELF binaries. Architectures: {', '.join(archs) if archs else 'unknown'}")
+    arch_summary = ", ".join(f"{a}×{len(v)}" for a, v in sorted(arch_map.items()))
+    _ok(f"Found {len(elf_files)} ELF binaries — {arch_summary or 'none'}")
+
     if elf_files:
         findings.append(Finding(
-            "ELF Binaries", LOW,
-            root,
-            f"{len(elf_files)} ELF binaries found. Architectures: {', '.join(archs)}"
+            "ELF Binaries", LOW, root,
+            f"{len(elf_files)} ELF binaries. Architectures: {arch_summary}"
         ))
+
+    # Flag SUID binaries — privilege escalation vector
+    stdout, _, _ = run_cmd(f'find "{root}" -perm -4000 -type f 2>/dev/null')
+    for suid in stdout.strip().splitlines():
+        if suid.strip():
+            findings.append(Finding(
+                "SUID Binary", HIGH, suid.strip(),
+                "SUID bit set — potential privilege escalation; review if necessary"
+            ))
+
     return findings
 
 
 def grep_dangerous_functions(root: Path):
-    _info("Grepping for dangerous C function calls...")
+    _info("Grepping for dangerous C function calls in source files...")
     findings = []
+
+    src_exts = '--include="*.c" --include="*.h" --include="*.cpp" --include="*.cc"'
 
     for func, (severity, explanation) in DANGEROUS_FUNCTIONS.items():
         pattern = rf'\b{func}\s*\('
-        stdout, _, rc = run_cmd(
-            f'grep -rn --include="*.c" --include="*.h" --include="*.cpp" '
-            f'-E "{pattern}" "{root}" 2>/dev/null | head -100'
+        stdout, _, _ = run_cmd(
+            f'grep -rn {src_exts} -E "{pattern}" "{root}" 2>/dev/null | head -100'
         )
         if stdout.strip():
             for line in stdout.strip().splitlines()[:20]:
@@ -376,48 +460,51 @@ def grep_dangerous_functions(root: Path):
                 fpath = parts[0] if len(parts) >= 1 else "?"
                 lineno = parts[1] if len(parts) >= 2 else "?"
                 findings.append(Finding(
-                    "Dangerous Function", severity,
-                    fpath, f"{func}() — {explanation}", line=lineno
+                    "Dangerous Function", severity, fpath,
+                    f"{func}() — {explanation}", line=lineno
                 ))
 
-    # Also search compiled binaries via strings
+    # Scan ELF strings for dangerous calls imported from PLT
     stdout, _, _ = run_cmd(
         f'find "{root}" -type f | xargs file 2>/dev/null | grep ELF | cut -d: -f1 | '
-        f'xargs -I{{}} strings {{}} 2>/dev/null | grep -E "\\b(system|popen|gets)\\s*\\(" | head -50'
+        f'xargs -I{{}} strings {{}} 2>/dev/null | '
+        f'grep -E "^(system|popen|gets|strcpy|strcat)$" | sort -u | head -20'
     )
     if stdout.strip():
+        funcs_found = stdout.strip().replace("\n", ", ")
         findings.append(Finding(
-            "Dangerous Function (binary)", MEDIUM,
-            root,
-            f"Dangerous function strings found in ELF binaries (use a disassembler to confirm)"
+            "Dangerous Function (binary)", MEDIUM, root,
+            f"PLT imports in ELF binaries: {funcs_found} — disassemble to trace call sites"
         ))
 
-    count = len([f for f in findings if f.category in ("Dangerous Function", "Dangerous Function (binary)")])
+    count = len([f for f in findings if "Dangerous Function" in f.category])
     _ok(f"Dangerous function scan: {count} matches")
     return findings
 
 
 def find_credentials(root: Path):
-    _info("Searching for hardcoded credentials...")
+    _info("Searching for hardcoded credentials in config/script/web files...")
     findings = []
 
-    config_exts = ["*.conf", "*.xml", "*.txt", "*.cfg", "*.ini", "*.json", "*.yaml", "*.yml", "*.env"]
-    ext_glob = " ".join(f'--include="{e}"' for e in config_exts)
+    ext_glob = " ".join(f'--include="{e}"' for e in CRED_FILE_EXTS)
+    false_positive_filter = r'example|sample|template|placeholder|YOUR_|<FILL|TODO|FIXME|dummy|test123'
 
-    for pattern, severity, label in CRED_PATTERNS:
+    for pattern, base_severity, label in CRED_PATTERNS:
         stdout, _, _ = run_cmd(
             f'grep -rni {ext_glob} -E "{pattern}" "{root}" 2>/dev/null | '
-            f'grep -v "example\\|sample\\|template\\|placeholder\\|YOUR_" | head -50'
+            f'grep -viE "{false_positive_filter}" | head -60'
         )
         if stdout.strip():
             for line in stdout.strip().splitlines()[:15]:
                 parts = line.split(":", 2)
-                fpath = parts[0] if len(parts) >= 1 else "?"
-                matched = parts[2].strip() if len(parts) >= 3 else line
-                # Redact value for safety in output
-                redacted = re.sub(r'(=\s*)(\S+)', r'\1[REDACTED]', matched)
+                fpath_str = parts[0] if len(parts) >= 1 else "?"
+                matched   = parts[2].strip() if len(parts) >= 3 else line
+                redacted  = re.sub(r'([=:]\s*)(\S+)', r'\1[REDACTED]', matched)
+
+                sev, note = credential_severity(base_severity, label, Path(fpath_str))
                 findings.append(Finding(
-                    "Hardcoded Credential", severity, fpath, f"{label}: {redacted}"
+                    "Hardcoded Credential", sev, fpath_str,
+                    f"{label}{note}: {redacted}"
                 ))
 
     count = len([f for f in findings if f.category == "Hardcoded Credential"])
@@ -425,32 +512,180 @@ def find_credentials(root: Path):
     return findings
 
 
+def find_passwd_shadow(root: Path):
+    _info("Auditing passwd and shadow files for weak/default accounts...")
+    findings = []
+
+    WEAK_HASHES = {
+        "$1$": "MD5crypt (weak)",
+        "$2$": "Blowfish/bcrypt (verify cost factor)",
+        "$apr1$": "Apache MD5 (weak)",
+    }
+
+    for p in root.rglob("*"):
+        if not p.is_file():
+            continue
+        if p.name not in ("passwd", "shadow", "group"):
+            continue
+        try:
+            content = p.read_text(errors="replace")
+        except (IOError, OSError):
+            continue
+
+        if p.name == "passwd":
+            for lineno, line in enumerate(content.splitlines(), 1):
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                parts = line.split(":")
+                if len(parts) < 7:
+                    continue
+                user, pw_field, uid, gid = parts[0], parts[1], parts[2], parts[3]
+                # Password hash in passwd (not shadow)
+                if pw_field not in ("x", "*", "!") and pw_field != "":
+                    findings.append(Finding(
+                        "System Account", CRITICAL, p,
+                        f"User '{user}' has password hash directly in /etc/passwd — shadow not used",
+                        line=str(lineno)
+                    ))
+                # Empty password field
+                if pw_field == "":
+                    findings.append(Finding(
+                        "System Account", CRITICAL, p,
+                        f"User '{user}' has EMPTY password in /etc/passwd",
+                        line=str(lineno)
+                    ))
+                # Root UID=0 account enabled
+                if uid == "0" and user != "root":
+                    findings.append(Finding(
+                        "System Account", HIGH, p,
+                        f"Non-root user '{user}' has UID=0 (root privileges)",
+                        line=str(lineno)
+                    ))
+                # Check for default Axis credentials
+                for default_user, _ in AXIS_DEFAULT_CREDS:
+                    if user == default_user and pw_field not in ("x", "*", "!"):
+                        findings.append(Finding(
+                            "System Account", CRITICAL, p,
+                            f"Default Axis credential username '{user}' with non-shadowed password",
+                            line=str(lineno)
+                        ))
+
+        elif p.name == "shadow":
+            for lineno, line in enumerate(content.splitlines(), 1):
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                parts = line.split(":")
+                if len(parts) < 2:
+                    continue
+                user, hash_field = parts[0], parts[1]
+                if hash_field in ("", "0"):
+                    findings.append(Finding(
+                        "System Account", CRITICAL, p,
+                        f"User '{user}' has empty/no password in /etc/shadow",
+                        line=str(lineno)
+                    ))
+                elif hash_field in ("*", "!"):
+                    pass  # disabled/locked — OK
+                else:
+                    for prefix, desc in WEAK_HASHES.items():
+                        if hash_field.startswith(prefix):
+                            sev = CRITICAL if "MD5" in desc else MEDIUM
+                            findings.append(Finding(
+                                "System Account", sev, p,
+                                f"User '{user}' uses {desc} password hash",
+                                line=str(lineno)
+                            ))
+
+    _ok(f"passwd/shadow audit: {len(findings)} findings")
+    return findings
+
+
 def find_scripts(root: Path):
     _info("Finding CGI and shell scripts...")
     findings = []
 
-    # CGI scripts
-    stdout, _, _ = run_cmd(f'find "{root}" -name "*.cgi" -o -name "*.sh" -o -name "*.bash" 2>/dev/null')
+    stdout, _, _ = run_cmd(
+        f'find "{root}" \\( -name "*.cgi" -o -name "*.sh" -o -name "*.bash" -o -name "*.pl" \\) 2>/dev/null'
+    )
     scripts = [Path(l.strip()) for l in stdout.splitlines() if l.strip()]
 
     for script in scripts:
-        cat = "CGI Script" if script.suffix == ".cgi" else "Shell Script"
-        severity = MEDIUM if script.suffix == ".cgi" else LOW
-        # check for shell injection patterns inside the script
-        risk_flag = ""
+        if script.suffix == ".cgi":
+            cat, severity = "CGI Script", MEDIUM
+        elif script.suffix in (".sh", ".bash"):
+            cat, severity = "Shell Script", LOW
+        else:
+            cat, severity = "Script", LOW
+
+        risk_flags = []
         try:
             content = script.read_text(errors="replace")
             if re.search(r'\$_(GET|POST|REQUEST|QUERY_STRING)', content):
                 severity = HIGH
-                risk_flag = " [user input → shell]"
-            elif re.search(r'system\s*\(|popen\s*\(|exec\s*\(|\$\(', content):
+                risk_flags.append("user-input→shell")
+            if re.search(r'\bsystem\s*\(|\bpopen\s*\(|\bexec\s*\(', content):
                 severity = HIGH
-                risk_flag = " [shell execution]"
+                risk_flags.append("shell-exec")
+            if re.search(r'QUERY_STRING|HTTP_POST', content) and re.search(r'`|\$\(', content):
+                severity = CRITICAL
+                risk_flags.append("backtick+CGI=RCE-risk")
+            if re.search(r'password\s*=|passwd\s*=|secret\s*=', content, re.IGNORECASE):
+                risk_flags.append("hardcoded-cred")
         except (IOError, OSError):
             pass
-        findings.append(Finding(cat, severity, script, f"{cat}{risk_flag}"))
+
+        detail = cat + (f" [{', '.join(risk_flags)}]" if risk_flags else "")
+        findings.append(Finding(cat, severity, script, detail))
 
     _ok(f"Scripts found: {len(scripts)}")
+    return findings
+
+
+def find_init_scripts(root: Path):
+    _info("Scanning init/rc scripts for embedded credentials and unsafe permissions...")
+    findings = []
+
+    init_dirs = ["etc/init.d", "etc/rc.d", "etc/rc.local", "etc/inittab"]
+    candidates = []
+    for d in init_dirs:
+        p = root / d
+        if p.is_dir():
+            candidates += list(p.rglob("*"))
+        elif p.is_file():
+            candidates.append(p)
+
+    for script in candidates:
+        if not script.is_file():
+            continue
+        try:
+            content = script.read_text(errors="replace")
+        except (IOError, OSError):
+            continue
+
+        if re.search(r'password\s*=|passwd\s*=|--password\s+\S', content, re.IGNORECASE):
+            findings.append(Finding(
+                "Init Script", HIGH, script,
+                "Hardcoded credential in init/rc script — rotates into every boot"
+            ))
+        if re.search(r'chmod\s+777|chmod\s+a\+w', content):
+            findings.append(Finding(
+                "Init Script", MEDIUM, script,
+                "World-writable permission (chmod 777/a+w) set at boot"
+            ))
+        if re.search(r'telnetd|ftpd\b', content):
+            findings.append(Finding(
+                "Init Script", HIGH, script,
+                "Plaintext network service (telnetd/ftpd) started at boot"
+            ))
+        if re.search(r'dropbear|sshd', content):
+            findings.append(Finding(
+                "Init Script", LOW, script,
+                "SSH daemon started at boot — verify key-only auth is enforced"
+            ))
+
+    _ok(f"Init script scan: {len(findings)} findings")
     return findings
 
 
@@ -458,41 +693,39 @@ def find_vapix_endpoints(root: Path):
     _info("Scanning for VAPIX / axis-cgi endpoints...")
     findings = []
 
+    grep_exts = ('--include="*.c" --include="*.h" --include="*.cgi" '
+                 '--include="*.sh" --include="*.conf" --include="*.xml" '
+                 '--include="*.html" --include="*.js" --include="*.php" '
+                 '--include="*.wsdl"')
+
     stdout, _, _ = run_cmd(
-        f'grep -rn --include="*.c" --include="*.h" --include="*.cgi" '
-        f'--include="*.sh" --include="*.conf" --include="*.xml" '
-        f'-E "axis-cgi|vapix|VAPIX" "{root}" 2>/dev/null | head -200'
+        f'grep -rn {grep_exts} -E "axis-cgi|vapix|VAPIX" "{root}" 2>/dev/null | head -300'
     )
 
-    seen_endpoints = set()
+    seen = set()
     for line in stdout.splitlines():
-        match = re.search(r'(/axis-cgi/[^\s"\'<>&]+)', line)
-        if match:
-            ep = match.group(1).rstrip(".,;)")
-            if ep in seen_endpoints:
-                continue
-            seen_endpoints.add(ep)
+        match = re.search(r'(/axis-cgi/[^\s"\'<>&,;)]+)', line)
+        if not match:
+            continue
+        ep = match.group(1).rstrip(".,;)")
+        if ep in seen:
+            continue
+        seen.add(ep)
+        is_unauth = any(re.search(pat, ep, re.IGNORECASE) for pat in VAPIX_UNAUTH_PATTERNS)
+        severity = CRITICAL if is_unauth else MEDIUM
+        auth_status = "NO — unauthenticated access possible" if is_unauth else "Unknown (verify)"
+        findings.append(Finding("VAPIX Endpoint", severity, ep, f"Authenticated: {auth_status}"))
 
-            # Check if it matches known unauthenticated patterns
-            is_unauth = any(re.search(p, ep, re.IGNORECASE) for p in VAPIX_UNAUTH_PATTERNS)
-            severity = CRITICAL if is_unauth else MEDIUM
-            auth_status = "NO (potential unauthenticated access)" if is_unauth else "Unknown"
-
-            findings.append(Finding(
-                "VAPIX Endpoint", severity, ep,
-                f"Authenticated: {auth_status}"
-            ))
-
-    # Also check for VAPIX parameter → shell command patterns
+    # Check for param → shell patterns near VAPIX handler code
     stdout2, _, _ = run_cmd(
         f'grep -rn --include="*.c" --include="*.cgi" --include="*.sh" '
-        f'-E "system|popen|exec" "{root}" 2>/dev/null | grep -i "param\\|cgi\\|query" | head -50'
+        f'-E "system|popen|exec" "{root}" 2>/dev/null | '
+        f'grep -iE "param|cgi|query|QUERY_STRING" | head -50'
     )
     if stdout2.strip():
         findings.append(Finding(
-            "VAPIX Shell Risk", HIGH,
-            root,
-            "CGI parameter may reach shell command execution — manual review required"
+            "VAPIX Shell Risk", HIGH, root,
+            "CGI parameter value may flow into shell command — trace input path manually"
         ))
 
     _ok(f"VAPIX endpoints found: {len([f for f in findings if f.category == 'VAPIX Endpoint'])}")
@@ -500,87 +733,233 @@ def find_vapix_endpoints(root: Path):
 
 
 def find_keys_and_certs(root: Path):
-    _info("Looking for private keys and certificates...")
+    _info("Looking for private keys, certificates, and SSH host keys...")
     findings = []
 
-    patterns = [
-        ("*.pem", "PEM file"),
-        ("*.key", "Private key"),
-        ("*.crt", "Certificate"),
-        ("*.cer", "Certificate"),
-        ("*.p12", "PKCS#12 bundle"),
-        ("*.pfx", "PFX bundle"),
-        ("*.der", "DER certificate"),
+    # File-extension-based scan
+    ext_patterns = [
+        ("*.pem",  "PEM bundle"),
+        ("*.key",  "Key file"),
+        ("*.crt",  "Certificate"),
+        ("*.cer",  "Certificate"),
+        ("*.p12",  "PKCS#12 bundle"),
+        ("*.pfx",  "PFX bundle"),
+        ("*.der",  "DER certificate"),
+        ("*.pub",  "Public key"),
     ]
-
-    for glob_pat, label in patterns:
+    for glob_pat, label in ext_patterns:
         for p in root.rglob(glob_pat):
-            severity = CRITICAL if "key" in p.suffix.lower() or "key" in p.name.lower() else HIGH
-            detail = label
+            _classify_key_or_cert(p, label, findings)
 
-            # Try to read cert expiry with openssl
-            if p.suffix in (".pem", ".crt", ".cer"):
-                out, _, rc = run_cmd(f'openssl x509 -in "{p}" -noout -enddate 2>/dev/null')
-                if rc == 0 and "notAfter" in out:
-                    expiry = out.strip().replace("notAfter=", "Expires: ")
-                    detail = f"{label} | {expiry}"
-                    if "2020" in expiry or "2019" in expiry or "2018" in expiry:
-                        severity = CRITICAL
-                        detail += " [EXPIRED]"
+    # SSH host and user key names (often no extension)
+    ssh_key_names = [
+        "ssh_host_rsa_key",      "ssh_host_ecdsa_key",
+        "ssh_host_ed25519_key",  "ssh_host_dsa_key",
+        "id_rsa",  "id_ecdsa",  "id_ed25519", "id_dsa",
+        "authorized_keys",
+    ]
+    for p in root.rglob("*"):
+        if p.is_file() and p.name in ssh_key_names:
+            label = f"SSH key — {p.name}"
+            _classify_key_or_cert(p, label, findings)
 
-            # Check if private key
-            try:
-                content = p.read_text(errors="replace")
-                if "PRIVATE KEY" in content:
-                    severity = CRITICAL
-                    detail = f"Private key file — {label}"
-            except (IOError, OSError):
-                pass
-
-            findings.append(Finding("Certificate/Key", severity, p, detail))
+    # Content-based scan: search for PEM headers in any file
+    stdout, _, _ = run_cmd(
+        f'grep -rln "BEGIN.*PRIVATE KEY\\|BEGIN.*CERTIFICATE\\|BEGIN.*PUBLIC KEY" '
+        f'"{root}" 2>/dev/null | head -50'
+    )
+    for path_str in stdout.strip().splitlines():
+        p = Path(path_str.strip())
+        if not any(f.path == str(p) for f in findings):
+            _classify_key_or_cert(p, "PEM content detected in file", findings)
 
     _ok(f"Keys/certs found: {len(findings)}")
     return findings
 
+def _classify_key_or_cert(p: Path, label: str, findings: list):
+    severity = HIGH
+    detail = label
+    try:
+        content = p.read_text(errors="replace")
+        if re.search(r'PRIVATE KEY', content):
+            severity = CRITICAL
+            detail = f"Private key — {label}"
+        elif "authorized_keys" in p.name:
+            severity = MEDIUM
+            detail = f"SSH authorized_keys — review for unexpected entries"
+    except (IOError, OSError):
+        pass
+
+    # Try openssl for cert expiry
+    if p.suffix in (".pem", ".crt", ".cer") or "crt" in p.name:
+        out, _, rc = run_cmd(f'openssl x509 -in "{p}" -noout -enddate 2>/dev/null')
+        if rc == 0 and "notAfter" in out:
+            expiry = out.strip().replace("notAfter=", "")
+            detail += f" | Expires: {expiry}"
+            # Flag clearly expired certs
+            try:
+                exp_year = int(re.search(r'\d{4}', expiry).group())
+                if exp_year < 2025:
+                    severity = CRITICAL
+                    detail += " ⚠️ EXPIRED"
+            except (AttributeError, ValueError):
+                pass
+
+    findings.append(Finding("Certificate/Key", severity, p, detail))
+
 
 def detect_vulnerable_libraries(root: Path):
-    _info("Detecting vulnerable library versions via strings...")
+    _info("Detecting vulnerable library versions via strings and filenames...")
     findings = []
 
-    # Collect strings from all ELF binaries and shared libs
-    stdout, _, _ = run_cmd(
-        f'find "{root}" \\( -name "*.so" -o -name "*.so.*" \\) -o '
-        f'\\( -type f -name "*" \\) | xargs file 2>/dev/null | grep ELF | '
-        f'cut -d: -f1 | head -100 | xargs -I{{}} strings {{}} 2>/dev/null | head -5000'
+    # Collect all strings from ELF binaries
+    elf_strings, _, _ = run_cmd(
+        f'find "{root}" -type f | xargs file 2>/dev/null | grep ELF | cut -d: -f1 | '
+        f'head -150 | xargs -I{{}} strings -n 6 {{}} 2>/dev/null | head -8000'
     )
-    # Also check version files and scripts
-    stdout2, _, _ = run_cmd(
-        f'find "{root}" -name "*.txt" -o -name "*.conf" -o -name "*.xml" | '
-        f'xargs grep -h -i "version\\|openssl\\|upnp\\|boa\\|thttpd\\|busybox\\|curl" 2>/dev/null | head -500'
+    # Collect from shared lib filenames
+    lib_filenames, _, _ = run_cmd(f'find "{root}" -name "*.so*" 2>/dev/null')
+    # Collect from text config/version files
+    text_content, _, _ = run_cmd(
+        f'find "{root}" \\( -name "*.txt" -o -name "*.conf" -o -name "*.xml" -o -name "*.ini" \\) | '
+        f'xargs grep -hi "version\\|openssl\\|upnp\\|boa\\|thttpd\\|busybox\\|curl\\|dropbear\\|zlib" '
+        f'2>/dev/null | head -800'
     )
 
-    combined = stdout + "\n" + stdout2
+    combined = "\n".join([elf_strings, lib_filenames, text_content])
 
-    for lib_name, lib_info in VULNERABLE_LIBS.items():
-        matches = re.findall(lib_info["pattern"], combined, re.IGNORECASE)
+    for lib_name, info in VULNERABLE_LIBS.items():
+        matches = re.findall(info["pattern"], combined, re.IGNORECASE)
         if matches:
-            version = matches[0] if matches else "detected (version unclear)"
-            cve_list = ", ".join(lib_info["cves"])
+            version = matches[0]
+            cve_list = "; ".join(info["cves"])
             findings.append(Finding(
-                "Vulnerable Library", HIGH,
-                root,
-                f"{lib_name} v{version} detected — Known CVEs: {cve_list}"
+                "Vulnerable Library", HIGH, root,
+                f"{lib_name} v{version} — CVEs: {cve_list}"
             ))
-        else:
-            # Pattern-free keyword detection
-            if lib_name.lower() in combined.lower():
-                findings.append(Finding(
-                    "Vulnerable Library", MEDIUM,
-                    root,
-                    f"{lib_name} detected (version unclear) — check: {', '.join(lib_info['cves'][:1])}"
-                ))
+        elif re.search(rf'\b{re.escape(lib_name)}\b', combined, re.IGNORECASE):
+            findings.append(Finding(
+                "Vulnerable Library", MEDIUM, root,
+                f"{lib_name} detected (version unclear) — check: {info['cves'][0]}"
+            ))
 
-    _ok(f"Library scan complete: {len(findings)} findings")
+    _ok(f"Library scan: {len(findings)} findings")
+    return findings
+
+
+def analyze_webserver_configs(root: Path):
+    _info("Analyzing web server configuration files...")
+    findings = []
+
+    config_names = ["boa.conf", "thttpd.conf", "httpd.conf", "lighttpd.conf", "nginx.conf"]
+    for conf_name in config_names:
+        for p in root.rglob(conf_name):
+            try:
+                content = p.read_text(errors="replace")
+            except (IOError, OSError):
+                continue
+
+            # Directory listing
+            if re.search(r'DirectoryIndex\s+on|dirlist\s*=\s*yes|autoindex\s+on', content, re.IGNORECASE):
+                findings.append(Finding("Web Server Config", MEDIUM, p,
+                    f"{conf_name}: Directory listing enabled — information disclosure"))
+
+            # Authentication disabled
+            if re.search(r'auth\s*=\s*no|NoAuth|AuthRequired\s+no', content, re.IGNORECASE):
+                findings.append(Finding("Web Server Config", CRITICAL, p,
+                    f"{conf_name}: Authentication explicitly disabled"))
+
+            # No TLS/SSL configuration
+            if not re.search(r'ssl|https|tls|certfile|keyfile', content, re.IGNORECASE):
+                findings.append(Finding("Web Server Config", HIGH, p,
+                    f"{conf_name}: No SSL/TLS configuration — HTTP only; credentials sent in plaintext"))
+
+            # CGI execution
+            if re.search(r'cgi-bin|CGIPath|cgi_path|cgibindir', content, re.IGNORECASE):
+                findings.append(Finding("Web Server Config", LOW, p,
+                    f"{conf_name}: CGI execution configured — ensure CGI scripts sanitize input"))
+
+            # Verbose errors / server tokens
+            if re.search(r'ServerTokens\s+Full|verbose_errors\s*=\s*(yes|1)|servertokens', content, re.IGNORECASE):
+                findings.append(Finding("Web Server Config", LOW, p,
+                    f"{conf_name}: Full server version disclosed in headers (info disclosure)"))
+
+            # Weak/deprecated SSL ciphers
+            if re.search(r'SSLv2|SSLv3|RC4|DES\b|NULL', content):
+                findings.append(Finding("Web Server Config", HIGH, p,
+                    f"{conf_name}: Deprecated/weak SSL cipher or protocol configured"))
+
+            # Listening on all interfaces
+            if re.search(r'bind\s*=?\s*0\.0\.0\.0|listen\s+0\.0\.0\.0', content):
+                findings.append(Finding("Web Server Config", MEDIUM, p,
+                    f"{conf_name}: Web server bound to 0.0.0.0 (all interfaces)"))
+
+    _ok(f"Web server config scan: {len(findings)} findings")
+    return findings
+
+
+def find_network_services(root: Path):
+    _info("Detecting insecure network services and debug interfaces...")
+    findings = []
+
+    # Telnet daemon — plaintext
+    stdout, _, _ = run_cmd(
+        f'find "{root}" \\( -name "telnetd" -o -name "in.telnetd" \\) 2>/dev/null'
+    )
+    for p in stdout.strip().splitlines():
+        if p.strip():
+            findings.append(Finding("Network Service", CRITICAL, p.strip(),
+                "telnetd binary found — plaintext remote access; attacker can capture credentials"))
+
+    # FTP daemon
+    stdout, _, _ = run_cmd(
+        f'find "{root}" \\( -name "ftpd" -o -name "vsftpd" -o -name "proftpd" \\) 2>/dev/null'
+    )
+    for p in stdout.strip().splitlines():
+        if p.strip():
+            findings.append(Finding("Network Service", HIGH, p.strip(),
+                "FTP daemon binary found — plaintext file transfer; use SFTP instead"))
+
+    # Dropbear / SSH
+    stdout, _, _ = run_cmd(f'find "{root}" -name "dropbear" -o -name "sshd" 2>/dev/null')
+    for p in stdout.strip().splitlines():
+        if p.strip():
+            findings.append(Finding("Network Service", LOW, p.strip(),
+                "SSH daemon found — verify password auth disabled, key-only access enforced"))
+
+    # SNMP config
+    stdout, _, _ = run_cmd(f'find "{root}" -name "snmpd.conf" 2>/dev/null')
+    for p in stdout.strip().splitlines():
+        if p.strip():
+            try:
+                content = Path(p.strip()).read_text(errors="replace")
+                if re.search(r'community\s+public|community\s+private', content, re.IGNORECASE):
+                    findings.append(Finding("Network Service", CRITICAL, p.strip(),
+                        "SNMP using default community strings 'public'/'private'"))
+                else:
+                    findings.append(Finding("Network Service", MEDIUM, p.strip(),
+                        "SNMP configuration found — verify community strings are not default"))
+            except (IOError, OSError):
+                pass
+
+    # Identify any listening port configs
+    stdout, _, _ = run_cmd(
+        f'grep -rn --include="*.conf" --include="*.xml" --include="*.ini" '
+        f'-iE "port\\s*=\\s*(21|23|69|161|512|513|514)\\b" "{root}" 2>/dev/null | head -20'
+    )
+    PORT_NAMES = {"21": "FTP", "23": "Telnet", "69": "TFTP", "161": "SNMP",
+                  "512": "rexec", "513": "rlogin", "514": "rsh/syslog"}
+    for line in stdout.strip().splitlines():
+        m = re.search(r'port\s*=\s*(\d+)', line, re.IGNORECASE)
+        if m:
+            port = m.group(1)
+            svc = PORT_NAMES.get(port, f"port {port}")
+            fpath = line.split(":")[0]
+            sev = CRITICAL if port in ("23", "512", "513", "514") else HIGH
+            findings.append(Finding("Network Service", sev, fpath,
+                f"Insecure service port {port} ({svc}) configured"))
+
+    _ok(f"Network service scan: {len(findings)} findings")
     return findings
 
 
@@ -588,78 +967,76 @@ def axis_specific_checks(root: Path):
     _info("Running Axis-specific checks...")
     findings = []
 
-    # 1. Boa / thttpd web server
+    # Boa / thttpd server binary presence
     for server in ["boa", "thttpd"]:
-        stdout, _, _ = run_cmd(
-            f'find "{root}" -name "{server}" -o -name "{server}.conf" 2>/dev/null'
-        )
+        stdout, _, _ = run_cmd(f'find "{root}" -name "{server}" 2>/dev/null')
         if stdout.strip():
-            findings.append(Finding(
-                "Web Server", HIGH, stdout.strip().splitlines()[0],
-                f"{server} web server found — common in legacy Axis devices; check for path traversal / DoS CVEs"
-            ))
+            p = stdout.strip().splitlines()[0]
+            findings.append(Finding("Web Server", HIGH, p,
+                f"{server} web server binary — review path traversal (CVE-2017-9833) and DoS CVEs"))
 
-    # 2. ONVIF service handlers
+    # ONVIF WSDL / handlers
     stdout, _, _ = run_cmd(
-        f'grep -rn --include="*.c" --include="*.h" --include="*.xml" --include="*.wsdl" '
-        f'-i "onvif" "{root}" 2>/dev/null | head -30'
+        f'grep -rln --include="*.c" --include="*.h" --include="*.xml" '
+        f'--include="*.wsdl" -i "onvif" "{root}" 2>/dev/null | head -10'
     )
     if stdout.strip():
-        findings.append(Finding(
-            "ONVIF Service", MEDIUM, root,
-            "ONVIF service handlers found — review authentication enforcement on service endpoints"
-        ))
+        file_list = stdout.strip().replace("\n", ", ")
+        findings.append(Finding("ONVIF Service", MEDIUM, root,
+            f"ONVIF handlers found in: {file_list[:120]} — audit auth on each operation"))
 
-    # 3. Strings: axis / AXIS / vapix attack surface mapping
-    stdout, _, _ = run_cmd(
-        f'grep -rn --include="*.c" --include="*.h" --include="*.cgi" --include="*.sh" '
-        f'-i "axis\\|vapix" "{root}" 2>/dev/null | grep -v "Binary file" | wc -l'
-    )
-    count = stdout.strip()
-    findings.append(Finding(
-        "Axis Attack Surface", LOW, root,
-        f"{count} source references to 'axis' or 'vapix' — use for attack surface mapping"
-    ))
-
-    # 4. VAPIX param → shell
+    # VAPIX param → direct shell
     stdout, _, _ = run_cmd(
         f'grep -rn --include="*.cgi" --include="*.sh" --include="*.c" '
         f'-E "(system|popen|exec).*cgi_param|cgi_param.*(system|popen|exec)" "{root}" 2>/dev/null | head -20'
     )
+    for line in stdout.strip().splitlines()[:5]:
+        fpath = line.split(":")[0]
+        findings.append(Finding("VAPIX Shell Injection", CRITICAL, fpath,
+            "CGI parameter passed directly to shell command — high confidence RCE path"))
+
+    # Attack surface: count axis/vapix references
+    stdout, _, _ = run_cmd(
+        f'grep -rn --include="*.c" --include="*.h" --include="*.cgi" '
+        f'--include="*.sh" --include="*.xml" -i "axis\\|vapix" '
+        f'"{root}" 2>/dev/null | grep -v "Binary file" | wc -l'
+    )
+    count = stdout.strip() or "0"
+    findings.append(Finding("Axis Attack Surface", LOW, root,
+        f"{count} references to 'axis'/'vapix' in source — map endpoints before testing"))
+
+    # Check for factory-default reset handler
+    stdout, _, _ = run_cmd(
+        f'grep -rn --include="*.c" --include="*.cgi" '
+        f'-i "factorydefault\\|factory_default\\|factory_reset" "{root}" 2>/dev/null | head -10'
+    )
     if stdout.strip():
-        for line in stdout.strip().splitlines()[:5]:
-            findings.append(Finding(
-                "VAPIX Shell Injection", CRITICAL, line.split(":")[0],
-                "CGI parameter passed directly to shell command — manual verification required"
-            ))
+        findings.append(Finding("VAPIX Endpoint", HIGH, root,
+            "Factory-default/reset handler present — verify auth requirement"))
 
     _ok(f"Axis-specific checks: {len(findings)} findings")
     return findings
 
 
-# ── Diff mode ────────────────────────────────────────────────────────────────
+# ── Diff mode ─────────────────────────────────────────────────────────────────
 
 def step_diff(dir_a: Path, dir_b: Path):
     _sep()
     _info("DIFF MODE — comparing two firmware versions")
     _sep()
 
-    stdout, _, _ = run_cmd(f'diff -rq "{dir_a}" "{dir_b}" 2>/dev/null | head -200')
+    stdout, _, _ = run_cmd(f'diff -rq "{dir_a}" "{dir_b}" 2>/dev/null | head -300')
     lines = stdout.strip().splitlines()
 
     added   = [l for l in lines if l.startswith("Only in") and str(dir_b) in l]
     removed = [l for l in lines if l.startswith("Only in") and str(dir_a) in l]
     changed = [l for l in lines if l.startswith("Files")]
 
-    _info(f"Added files:   {len(added)}")
-    _info(f"Removed files: {len(removed)}")
-    _info(f"Changed files: {len(changed)}")
+    _info(f"Added:   {len(added)} files")
+    _info(f"Removed: {len(removed)} files")
+    _info(f"Changed: {len(changed)} files")
 
-    return {
-        "added": added[:50],
-        "removed": removed[:50],
-        "changed": changed[:50],
-    }
+    return {"added": added[:50], "removed": removed[:50], "changed": changed[:50]}
 
 
 # ── Step 3: Report Generation ─────────────────────────────────────────────────
@@ -671,7 +1048,7 @@ def count_by_severity(findings):
     return counts
 
 
-def generate_report(findings, target: Path, output_dir: Path, fmt: str, diff_data=None, compare=None):
+def generate_report(findings, target, output_dir, fmt, diff_data=None, compare=None):
     _sep()
     _info("STEP 3 — REPORT GENERATION")
     _sep()
@@ -679,10 +1056,7 @@ def generate_report(findings, target: Path, output_dir: Path, fmt: str, diff_dat
     output_dir.mkdir(parents=True, exist_ok=True)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-    if fmt == "markdown":
-        report_path = output_dir / f"firmsec_report_{ts}.md"
-        content = build_markdown_report(findings, target, diff_data, compare)
-    elif fmt == "json":
+    if fmt == "json":
         report_path = output_dir / f"firmsec_report_{ts}.json"
         content = build_json_report(findings, target, diff_data, compare)
     else:
@@ -694,29 +1068,31 @@ def generate_report(findings, target: Path, output_dir: Path, fmt: str, diff_dat
     return report_path
 
 
-def build_markdown_report(findings, target: Path, diff_data, compare):
+def build_markdown_report(findings, target, diff_data, compare):
     counts = count_by_severity(findings)
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-    def findings_of(category):
-        return sorted([f for f in findings if f.category == category], key=lambda f: f.sort_key())
+    def findings_of(*categories):
+        return sorted(
+            [f for f in findings if f.category in categories],
+            key=lambda f: f.sort_key()
+        )
 
-    def severity_badge(sev):
-        badges = {CRITICAL: "🔴", HIGH: "🟠", MEDIUM: "🟡", LOW: "🔵"}
-        return badges.get(sev, "⚪")
+    def badge(sev):
+        return {CRITICAL: "🔴", HIGH: "🟠", MEDIUM: "🟡", LOW: "🔵"}.get(sev, "⚪")
 
-    lines = []
-    lines += [
-        f"# FirmSec Analysis Report",
-        f"",
+    L = []
+    L += [
+        "# FirmSec Analysis Report",
+        "",
         f"> Generated: {now}  ",
         f"> Target: `{target}`  ",
-        f"> Tool: FirmSec v1.0 (Axis OS Firmware Security Analyzer)",
-        f"",
+        f"> Tool: FirmSec v1.2 (Axis OS Firmware Security Analyzer)",
+        "",
     ]
 
     # ── Executive Summary ──────────────────────────────────────────────────────
-    lines += [
+    L += [
         "## Executive Summary",
         "",
         "| Severity | Count |",
@@ -727,190 +1103,208 @@ def build_markdown_report(findings, target: Path, diff_data, compare):
         f"| 🔵 Low      | {counts[LOW]} |",
         f"| **Total**   | **{sum(counts.values())}** |",
         "",
-        f"**Firmware target:** `{target.name}`  ",
+        f"**Firmware target:** `{Path(str(target)).name}`  ",
         f"**Target device:** Axis OS (camera / IoT device)  ",
         f"**Analysis date:** {now}  ",
         "",
     ]
-
     if counts[CRITICAL] > 0:
-        lines.append(f"> ⚠️ **{counts[CRITICAL]} CRITICAL findings require immediate attention.**")
-        lines.append("")
+        L.append(f"> ⚠️ **{counts[CRITICAL]} CRITICAL findings require immediate attention.**")
+        L.append("")
 
     # ── Dangerous Functions ────────────────────────────────────────────────────
-    df = findings_of("Dangerous Function") + findings_of("Dangerous Function (binary)")
-    lines += ["## Dangerous Functions", ""]
+    df = findings_of("Dangerous Function", "Dangerous Function (binary)")
+    L += ["## Dangerous Functions", ""]
     if df:
-        lines += [
-            "| Severity | File | Line | Function | Notes |",
-            "|----------|------|------|----------|-------|",
-        ]
+        L += ["| Severity | File | Line | Detail |",
+              "|----------|------|------|--------|"]
         for f in df:
-            badge = severity_badge(f.severity)
             fname = Path(f.path).name
-            lineno = f.line or "—"
-            lines.append(f"| {badge} {f.severity} | `{fname}` | {lineno} | {f.detail} | |")
+            L.append(f"| {badge(f.severity)} {f.severity} | `{fname}` | {f.line or '—'} | {f.detail} |")
     else:
-        lines.append("_No dangerous function calls found in source files._")
-    lines.append("")
+        L.append("_No dangerous function calls found._")
+    L.append("")
 
     # ── Hardcoded Credentials ──────────────────────────────────────────────────
     hc = findings_of("Hardcoded Credential")
-    lines += ["## Hardcoded Credentials", ""]
+    L += ["## Hardcoded Credentials", ""]
     if hc:
-        lines += [
-            "| Severity | File | Match |",
-            "|----------|------|-------|",
-        ]
+        L += ["| Severity | File | Match |",
+              "|----------|------|-------|"]
         for f in hc:
-            badge = severity_badge(f.severity)
-            fname = Path(f.path).name
-            lines.append(f"| {badge} {f.severity} | `{fname}` | `{f.detail}` |")
+            L.append(f"| {badge(f.severity)} {f.severity} | `{Path(f.path).name}` | `{f.detail}` |")
     else:
-        lines.append("_No hardcoded credentials detected._")
-    lines.append("")
+        L.append("_No hardcoded credentials detected._")
+    L.append("")
+
+    # ── System Accounts ────────────────────────────────────────────────────────
+    sa = findings_of("System Account")
+    L += ["## System Accounts (passwd / shadow)", ""]
+    if sa:
+        L += ["| Severity | File | Line | Detail |",
+              "|----------|------|------|--------|"]
+        for f in sa:
+            L.append(f"| {badge(f.severity)} {f.severity} | `{Path(f.path).name}` | {f.line or '—'} | {f.detail} |")
+    else:
+        L.append("_No passwd/shadow issues found._")
+    L.append("")
 
     # ── VAPIX Endpoints ────────────────────────────────────────────────────────
-    ve = findings_of("VAPIX Endpoint") + findings_of("VAPIX Shell Risk") + findings_of("VAPIX Shell Injection")
-    lines += ["## VAPIX Endpoints", ""]
+    ve = findings_of("VAPIX Endpoint", "VAPIX Shell Risk", "VAPIX Shell Injection")
+    L += ["## VAPIX Endpoints", ""]
     if ve:
-        lines += [
-            "| Severity | Endpoint / Path | Authentication | Risk |",
-            "|----------|-----------------|----------------|------|",
-        ]
+        L += ["| Severity | Endpoint / Location | Detail |",
+              "|----------|---------------------|--------|"]
         for f in ve:
-            badge = severity_badge(f.severity)
-            lines.append(f"| {badge} {f.severity} | `{f.path}` | {f.detail} | — |")
+            L.append(f"| {badge(f.severity)} {f.severity} | `{f.path}` | {f.detail} |")
     else:
-        lines.append("_No VAPIX endpoints detected._")
-    lines.append("")
+        L.append("_No VAPIX endpoints detected._")
+    L.append("")
 
-    # ── CGI Scripts ───────────────────────────────────────────────────────────
-    cgi = findings_of("CGI Script") + findings_of("Shell Script")
-    lines += ["## CGI and Shell Scripts", ""]
-    if cgi:
-        lines += [
-            "| Severity | File | Type | Notes |",
-            "|----------|------|------|-------|",
-        ]
-        for f in cgi:
-            badge = severity_badge(f.severity)
-            fname = Path(f.path).name
-            lines.append(f"| {badge} {f.severity} | `{fname}` | {f.category} | {f.detail} |")
+    # ── CGI and Shell Scripts ──────────────────────────────────────────────────
+    sc = findings_of("CGI Script", "Shell Script", "Script")
+    L += ["## CGI and Shell Scripts", ""]
+    if sc:
+        L += ["| Severity | File | Type | Detail |",
+              "|----------|------|------|--------|"]
+        for f in sc:
+            L.append(f"| {badge(f.severity)} {f.severity} | `{Path(f.path).name}` | {f.category} | {f.detail} |")
     else:
-        lines.append("_No CGI or shell scripts found._")
-    lines.append("")
+        L.append("_No scripts found._")
+    L.append("")
+
+    # ── Init Scripts ───────────────────────────────────────────────────────────
+    init = findings_of("Init Script")
+    L += ["## Init / RC Scripts", ""]
+    if init:
+        L += ["| Severity | File | Detail |",
+              "|----------|------|--------|"]
+        for f in init:
+            L.append(f"| {badge(f.severity)} {f.severity} | `{Path(f.path).name}` | {f.detail} |")
+    else:
+        L.append("_No init script issues found._")
+    L.append("")
 
     # ── Certificates and Keys ─────────────────────────────────────────────────
     ck = findings_of("Certificate/Key")
-    lines += ["## Certificates and Keys", ""]
+    L += ["## Certificates and Keys", ""]
     if ck:
-        lines += [
-            "| Severity | File | Details |",
-            "|----------|------|---------|",
-        ]
+        L += ["| Severity | File | Detail |",
+              "|----------|------|--------|"]
         for f in ck:
-            badge = severity_badge(f.severity)
-            fname = Path(f.path).name
-            lines.append(f"| {badge} {f.severity} | `{fname}` | {f.detail} |")
+            L.append(f"| {badge(f.severity)} {f.severity} | `{Path(f.path).name}` | {f.detail} |")
     else:
-        lines.append("_No certificates or keys found._")
-    lines.append("")
+        L.append("_No certificates or keys found._")
+    L.append("")
 
     # ── Vulnerable Libraries ──────────────────────────────────────────────────
     vl = findings_of("Vulnerable Library")
-    lines += ["## Vulnerable Libraries", ""]
+    L += ["## Vulnerable Libraries", ""]
     if vl:
-        lines += [
-            "| Severity | Library | Details |",
-            "|----------|---------|---------|",
-        ]
+        L += ["| Severity | Detail |",
+              "|----------|--------|"]
         for f in vl:
-            badge = severity_badge(f.severity)
-            lines.append(f"| {badge} {f.severity} | — | {f.detail} |")
+            L.append(f"| {badge(f.severity)} {f.severity} | {f.detail} |")
     else:
-        lines.append("_No vulnerable library versions detected._")
-    lines.append("")
+        L.append("_No vulnerable library versions detected._")
+    L.append("")
 
-    # ── Axis-Specific ─────────────────────────────────────────────────────────
-    ax = (findings_of("Web Server") + findings_of("ONVIF Service") +
-          findings_of("Axis Attack Surface") + findings_of("ELF Binaries"))
-    lines += ["## Axis-Specific Findings", ""]
+    # ── Web Server Configuration ───────────────────────────────────────────────
+    wc = findings_of("Web Server Config", "Web Server")
+    L += ["## Web Server Configuration", ""]
+    if wc:
+        L += ["| Severity | File | Detail |",
+              "|----------|------|--------|"]
+        for f in wc:
+            L.append(f"| {badge(f.severity)} {f.severity} | `{Path(f.path).name}` | {f.detail} |")
+    else:
+        L.append("_No web server config issues found._")
+    L.append("")
+
+    # ── Network Services ──────────────────────────────────────────────────────
+    ns = findings_of("Network Service")
+    L += ["## Network Services", ""]
+    if ns:
+        L += ["| Severity | Path / Config | Detail |",
+              "|----------|---------------|--------|"]
+        for f in ns:
+            L.append(f"| {badge(f.severity)} {f.severity} | `{Path(f.path).name}` | {f.detail} |")
+    else:
+        L.append("_No insecure network service findings._")
+    L.append("")
+
+    # ── SUID Binaries ─────────────────────────────────────────────────────────
+    suid = findings_of("SUID Binary")
+    L += ["## SUID Binaries", ""]
+    if suid:
+        L += ["| Severity | Path | Detail |",
+              "|----------|------|--------|"]
+        for f in suid:
+            L.append(f"| {badge(f.severity)} {f.severity} | `{f.path}` | {f.detail} |")
+    else:
+        L.append("_No SUID binaries found._")
+    L.append("")
+
+    # ── Axis-Specific Findings ─────────────────────────────────────────────────
+    ax = findings_of("ONVIF Service", "Axis Attack Surface", "ELF Binaries")
+    L += ["## Axis-Specific Findings", ""]
     if ax:
-        lines += [
-            "| Severity | Category | Details |",
-            "|----------|----------|---------|",
-        ]
+        L += ["| Severity | Category | Detail |",
+              "|----------|----------|--------|"]
         for f in ax:
-            badge = severity_badge(f.severity)
-            lines.append(f"| {badge} {f.severity} | {f.category} | {f.detail} |")
+            L.append(f"| {badge(f.severity)} {f.severity} | {f.category} | {f.detail} |")
     else:
-        lines.append("_No Axis-specific findings._")
-    lines.append("")
+        L.append("_No Axis-specific findings._")
+    L.append("")
 
-    # ── Diff Section ──────────────────────────────────────────────────────────
+    # ── Firmware Diff ─────────────────────────────────────────────────────────
     if diff_data:
-        lines += ["## Firmware Diff", "", f"Comparing `{target}` vs `{compare}`", ""]
-        lines += [f"- **Added files:** {len(diff_data['added'])}",
-                  f"- **Removed files:** {len(diff_data['removed'])}",
-                  f"- **Changed files:** {len(diff_data['changed'])}", ""]
-        if diff_data["added"]:
-            lines += ["### Added Files", "```"]
-            lines += diff_data["added"][:20]
-            lines += ["```", ""]
-        if diff_data["removed"]:
-            lines += ["### Removed Files", "```"]
-            lines += diff_data["removed"][:20]
-            lines += ["```", ""]
-        if diff_data["changed"]:
-            lines += ["### Changed Files", "```"]
-            lines += diff_data["changed"][:20]
-            lines += ["```", ""]
+        L += ["## Firmware Diff", "",
+              f"Comparing `{target}` vs `{compare}`", "",
+              f"- **Added:** {len(diff_data['added'])} files",
+              f"- **Removed:** {len(diff_data['removed'])} files",
+              f"- **Changed:** {len(diff_data['changed'])} files", ""]
+        for section, key in [("Added", "added"), ("Removed", "removed"), ("Changed", "changed")]:
+            if diff_data[key]:
+                L += [f"### {section} Files", "```"] + diff_data[key][:25] + ["```", ""]
 
     # ── Recommended Next Steps ────────────────────────────────────────────────
-    lines += ["## Recommended Next Steps", ""]
+    L += ["## Recommended Next Steps", ""]
     steps = []
+    n = 1
     if counts[CRITICAL] > 0:
-        steps.append("1. 🔴 **[CRITICAL]** Remove or rotate all hardcoded credentials and private keys immediately.")
-        steps.append("2. 🔴 **[CRITICAL]** Audit unauthenticated VAPIX endpoints — enforce digest/basic auth or mTLS.")
+        steps.append(f"{n}. 🔴 **[CRITICAL]** Remove or rotate all hardcoded credentials, private keys, and default passwords."); n+=1
+        steps.append(f"{n}. 🔴 **[CRITICAL]** Enforce authentication on all VAPIX endpoints — use digest auth or mTLS."); n+=1
+        steps.append(f"{n}. 🔴 **[CRITICAL]** Disable or firewall telnetd; replace with SSH (key-only)."); n+=1
     if counts[HIGH] > 0:
-        steps.append("3. 🟠 **[HIGH]** Review dangerous function usage (especially `system()`, `popen()`, `strcpy()`) for user-controlled input paths.")
-        steps.append("4. 🟠 **[HIGH]** Update vulnerable libraries (OpenSSL, libupnp, Boa) to patched versions.")
+        steps.append(f"{n}. 🟠 **[HIGH]** Audit dangerous functions (`system()`, `popen()`, `strcpy()`) for user-controlled input."); n+=1
+        steps.append(f"{n}. 🟠 **[HIGH]** Patch/replace vulnerable libraries: OpenSSL, libupnp, Boa, thttpd."); n+=1
+        steps.append(f"{n}. 🟠 **[HIGH]** Enable HTTPS-only for the web server; disable HTTP on port 80."); n+=1
     if counts[MEDIUM] > 0:
-        steps.append("5. 🟡 **[MEDIUM]** Audit CGI scripts for parameter sanitization before shell execution.")
-        steps.append("6. 🟡 **[MEDIUM]** Review ONVIF service endpoint authentication.")
+        steps.append(f"{n}. 🟡 **[MEDIUM]** Sanitize all CGI script parameters before use in shell commands."); n+=1
+        steps.append(f"{n}. 🟡 **[MEDIUM]** Audit ONVIF service operations for authentication requirements."); n+=1
     steps += [
-        "7. 🔵 **[GENERAL]** Enable Axis firmware signing and secure boot if not already active.",
-        "8. 🔵 **[GENERAL]** Cross-reference all `axis-cgi` endpoints against the VAPIX API reference for required auth levels.",
-        "9. 🔵 **[GENERAL]** Run dynamic analysis / fuzzing on high-risk CGI endpoints in an isolated lab.",
-        "10. 🔵 **[GENERAL]** Subscribe to Axis security advisories: https://www.axis.com/support/cybersecurity/security-advisories",
+        f"{n}. 🔵 Enable Axis firmware signing and Secure Boot if supported by device generation.",
+        f"{n+1}. 🔵 Cross-reference axis-cgi endpoints against the VAPIX API library for required auth levels.",
+        f"{n+2}. 🔵 Run dynamic fuzzing on high-risk CGI endpoints in an isolated test lab.",
+        f"{n+3}. 🔵 Subscribe to Axis security advisories: https://www.axis.com/support/cybersecurity/security-advisories",
     ]
-    lines += steps
-    lines.append("")
-    lines += [
-        "---",
-        f"_Report generated by FirmSec v1.0 — {now}_",
-    ]
+    L += steps
+    L += ["", "---", f"_Report generated by FirmSec v1.2 — {now}_"]
 
-    return "\n".join(lines)
+    return "\n".join(L)
 
 
 def build_json_report(findings, target, diff_data, compare):
-    import json
     data = {
-        "tool": "FirmSec v1.0",
+        "tool": "FirmSec v1.2",
         "generated": datetime.now().isoformat(),
         "target": str(target),
         "compare": str(compare) if compare else None,
         "summary": count_by_severity(findings),
         "findings": [
-            {
-                "category": f.category,
-                "severity": f.severity,
-                "path": f.path,
-                "detail": f.detail,
-                "line": f.line,
-            }
+            {"category": f.category, "severity": f.severity,
+             "path": f.path, "detail": f.detail, "line": f.line}
             for f in sorted(findings, key=lambda x: x.sort_key())
         ],
         "diff": diff_data,
@@ -918,7 +1312,7 @@ def build_json_report(findings, target, diff_data, compare):
     return json.dumps(data, indent=2)
 
 
-# ── Print summary to terminal ─────────────────────────────────────────────────
+# ── Terminal summary ──────────────────────────────────────────────────────────
 
 def print_terminal_summary(findings):
     counts = count_by_severity(findings)
@@ -926,20 +1320,35 @@ def print_terminal_summary(findings):
     _info("FINDINGS SUMMARY")
     _sep()
 
+    # Category breakdown
+    categories: dict[str, int] = {}
+    for f in findings:
+        categories[f.category] = categories.get(f.category, 0) + 1
+
     if HAS_RICH:
-        table = Table(title="FirmSec Results", show_header=True, header_style="bold magenta")
-        table.add_column("Severity", style="bold")
-        table.add_column("Count", justify="right")
-        table.add_column("Top Finding")
+        sev_table = Table(title="Severity Breakdown", header_style="bold magenta", show_header=True)
+        sev_table.add_column("Severity", style="bold")
+        sev_table.add_column("Count", justify="right")
+        sev_table.add_column("Sample Finding")
+        colors = {CRITICAL: "red", HIGH: "magenta", MEDIUM: "yellow", LOW: "cyan"}
         for sev in [CRITICAL, HIGH, MEDIUM, LOW]:
-            sev_findings = [f for f in findings if f.severity == sev]
-            top = sev_findings[0].detail[:60] if sev_findings else "—"
-            colors = {CRITICAL: "red", HIGH: "magenta", MEDIUM: "yellow", LOW: "cyan"}
-            table.add_row(f"[{colors[sev]}]{sev}[/{colors[sev]}]", str(counts[sev]), top)
-        console.print(table)
+            sev_f = [f for f in findings if f.severity == sev]
+            top = sev_f[0].detail[:65] if sev_f else "—"
+            sev_table.add_row(f"[{colors[sev]}]{sev}[/{colors[sev]}]", str(counts[sev]), top)
+        console.print(sev_table)
+
+        cat_table = Table(title="Category Breakdown", header_style="bold blue", show_header=True)
+        cat_table.add_column("Category")
+        cat_table.add_column("Count", justify="right")
+        for cat, cnt in sorted(categories.items(), key=lambda x: -x[1]):
+            cat_table.add_row(cat, str(cnt))
+        console.print(cat_table)
     else:
         for sev in [CRITICAL, HIGH, MEDIUM, LOW]:
             print(f"  {severity_color(sev):10s}: {counts[sev]}")
+        print()
+        for cat, cnt in sorted(categories.items(), key=lambda x: -x[1]):
+            print(f"  {cat:<35s}: {cnt}")
 
 
 # ── CLI Entry Point ───────────────────────────────────────────────────────────
@@ -947,24 +1356,26 @@ def print_terminal_summary(findings):
 def parse_args():
     parser = argparse.ArgumentParser(
         prog="firmsec",
-        description="FirmSec — Axis OS Firmware Security Analyzer",
+        description="FirmSec v1.2 — Axis OS Firmware Security Analyzer",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
   firmsec.py --target axis_firmware.bin
-  firmsec.py --target axis_firmware.bin --output ./my_reports --format json
+  firmsec.py --target axis_firmware.bin --output ./reports --format json
   firmsec.py --target axis_fw_v9.bin --compare axis_fw_v10.bin
-  firmsec.py --target ./extracted_firmware/ --skip-extract
+  firmsec.py --target ./extracted/ --skip-extract
   firmsec.py --target axis_firmware.bin --kali
         """
     )
-    parser.add_argument("--target",       required=True,      help="Path to firmware binary or extracted directory")
-    parser.add_argument("--compare",      default=None,       help="Second firmware for diff comparison")
-    parser.add_argument("--output",       default="./reports",help="Output directory for reports")
-    parser.add_argument("--format",       default="markdown", choices=["markdown", "json", "html"],
+    parser.add_argument("--target",       required=True,       help="Firmware binary or pre-extracted directory")
+    parser.add_argument("--compare",      default=None,        help="Second firmware for diff comparison")
+    default_reports = str(Path(__file__).parent / "reports")
+    parser.add_argument("--output",       default=default_reports,
+                        help=f"Output directory (default: {default_reports})")
+    parser.add_argument("--format",       default="markdown",  choices=["markdown", "json"],
                         help="Report format (default: markdown)")
-    parser.add_argument("--skip-extract", action="store_true",help="Skip extraction (use if already extracted)")
-    parser.add_argument("--kali",         action="store_true",help="Adjust tool paths for Kali Linux")
+    parser.add_argument("--skip-extract", action="store_true", help="Skip binwalk; target is a directory")
+    parser.add_argument("--kali",         action="store_true", help="Kali Linux tool path hints")
     return parser.parse_args()
 
 
@@ -975,13 +1386,13 @@ def main():
 
     if HAS_RICH:
         console.print(Panel.fit(
-            "[bold cyan]FirmSec v1.0[/bold cyan] — Axis OS Firmware Security Analyzer\n"
+            "[bold cyan]FirmSec v1.2[/bold cyan] — Axis OS Firmware Security Analyzer\n"
             "[dim]Optimized for Axis OS | Mac + Kali Linux[/dim]",
             border_style="cyan"
         ))
     else:
         print("=" * 60)
-        print("  FirmSec v1.0 — Axis OS Firmware Security Analyzer")
+        print("  FirmSec v1.2 — Axis OS Firmware Security Analyzer")
         print("=" * 60)
 
     if not target.exists():
@@ -991,41 +1402,29 @@ def main():
     diff_data = None
     compare_path = None
 
-    # ── Extraction ────────────────────────────────────────────────────────────
     if target.is_file() and not args.skip_extract:
         extract_dir, fs_type = step_extract(target, args.kali)
     elif target.is_dir() or args.skip_extract:
         extract_dir = target
         fs_type = detect_filesystem(target)
-        _info(f"Using pre-extracted directory: {extract_dir} (fs: {fs_type})")
+        _info(f"Pre-extracted directory: {extract_dir} (fs: {fs_type})")
         print_tree_summary(extract_dir)
     else:
-        _err("Target must be a file (firmware) or directory (extracted).")
+        _err("Target must be a firmware file or extracted directory.")
         sys.exit(1)
 
-    # ── Diff ──────────────────────────────────────────────────────────────────
     if args.compare:
         compare_path = Path(args.compare).resolve()
-        if compare_path.is_file():
-            compare_extract, _ = step_extract(compare_path, args.kali)
-        else:
-            compare_extract = compare_path
+        compare_extract = compare_path if compare_path.is_dir() else step_extract(compare_path, args.kali)[0]
         diff_data = step_diff(extract_dir, compare_extract)
 
-    # ── Analysis ──────────────────────────────────────────────────────────────
     findings = step_analyze(extract_dir, args.kali)
-
-    # ── Terminal summary ──────────────────────────────────────────────────────
     print_terminal_summary(findings)
 
-    # ── Report ────────────────────────────────────────────────────────────────
-    report_path = generate_report(
-        findings, target, output_dir,
-        args.format, diff_data, compare_path
-    )
+    report_path = generate_report(findings, target, output_dir, args.format, diff_data, compare_path)
 
     _sep()
-    _ok(f"Done! Report: {report_path}")
+    _ok(f"Done! Report → {report_path}")
     if HAS_RICH:
         console.print(Panel(f"[green]Report saved:[/green] [bold]{report_path}[/bold]", border_style="green"))
 
