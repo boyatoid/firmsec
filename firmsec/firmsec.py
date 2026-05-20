@@ -234,9 +234,15 @@ def credential_severity(base_severity: str, label: str, fpath: Path) -> tuple:
 #   showdown*.js        hits on variable names like "secret", "token", "root".
 
 FALSE_POSITIVE_RULES = [
-    (r'^par_[^/]*\.conf$',          r'^\s*accessControl\s*='),
+    # par_*.conf — VAPIX parameter schema files:
+    #   "accessControl = admin"  → ACL level enum, not a secret
+    #   "type = password:writeonly"  → parameter type annotation, not a value
+    (r'^par_[^/]*\.conf$',          r'^\s*accessControl\s*=|^\s*type\s*=\s*"?password'),
     (r'^nsswitch\.conf$',           r'^\s*passwd\s*:'),
-    (r'^com\.axis\.[^/]*\.xml$',    r'@(passwd|clear_passwd)\b'),
+    # com.axis.*.xml — D-Bus interface documentation:
+    #   "@passwd" / "@clear_passwd" / "@username" are argument names, not values
+    #   "<arg … name=\"username\"" is XML schema, not a credential
+    (r'^com\.axis\.[^/]*\.xml$',    r'@(passwd|clear_passwd|username)\b|name="(username|passwd)"'),
     (r'^httpd\.conf$',              r'#\s*(ServerAdmin|ServerRoot|DocumentRoot)\b'),
     (r'^(limited_access|adp)\.sh$', r'(_allow_root|_exec_as_root|_deprecated_access)\s*[=!]'),
     (r'\.min\.js$',                 r'.*'),
@@ -738,13 +744,17 @@ def get_vapix_auth_evidence(ep: str, ref_fpath: str, ref_lineno: str, root: Path
     hint is one of 'auth', 'unauth', or 'unknown'.
 
     Strategy:
-      1. Parse Apache2 conf files in etc/apache2 for <Location> blocks covering the
-         endpoint path.  The most-specific (longest) matching block wins.
-         - If the block contains AuthType + Require valid-user → hint='auth'
-         - If the block has Require all denied             → hint='auth'
-         - If the block exists with no auth directives    → hint='unauth'
-      2. Fall back to VAPIX_UNAUTH_PATTERNS if no Apache config match.
-      3. Always try to return surrounding source lines as additional context.
+      1. Scan Apache2 conf files for <Location>/<LocationMatch> blocks covering the
+         endpoint path. Most-specific (longest) matching block wins.
+         - AuthType + Require (valid-user OR axis-group) → hint='auth'
+         - Require all denied                            → hint='auth'
+         - Location block with no auth directives        → hint='unauth'
+      2. If no Location block matches, check for a global AuthType directive in
+         any Apache conf file (outside a Location block) — Axis OS 11.x sets
+         AuthType Digest globally in httpd-digest.conf; endpoints that don't
+         have their own Location block inherit this.
+      3. Fall back to VAPIX_UNAUTH_PATTERNS pattern matching.
+      4. Always return surrounding source lines as additional context.
     """
     hint       = "unknown"
     auth_label = "Unknown — verify with live device or Apache2 config"
@@ -764,9 +774,10 @@ def get_vapix_auth_evidence(ep: str, ref_fpath: str, ref_lineno: str, root: Path
     ep_base     = ep.split("?")[0].rstrip("/") or "/"
 
     best_match_len = -1
-    best_hint   = None
-    best_label  = None
+    best_hint      = None
+    best_label     = None
     best_conf_snip = None
+    global_auth_conf = None   # file that carries a bare AuthType directive
 
     for apache_dir in apache_dirs:
         if not apache_dir.is_dir():
@@ -776,39 +787,69 @@ def get_vapix_auth_evidence(ep: str, ref_fpath: str, ref_lineno: str, root: Path
                 conf_content = conf_file.read_text(errors="replace")
             except (IOError, OSError):
                 continue
+
+            # Detect bare (non-Location-wrapped) global AuthType
+            # Axis OS uses httpd-digest.conf / httpd-basic.conf at the top level.
+            bare_auth = re.search(r'(?m)^AuthType\s+\S+', conf_content)
+            if bare_auth and not re.search(r'<Location', conf_content, re.IGNORECASE):
+                global_auth_conf = conf_file.name
+
+            # Scan <Location> and <LocationMatch> blocks
             for loc_m in re.finditer(
-                r'<Location\s+([^>]+)>(.*?)</Location>',
+                r'<Location(?:Match)?\s+([^>]+)>(.*?)</Location(?:Match)?>',
                 conf_content, re.IGNORECASE | re.DOTALL
             ):
-                loc_path  = loc_m.group(1).strip().rstrip("/") or "/"
+                loc_path  = loc_m.group(1).strip().strip('"').rstrip("/") or "/"
                 block     = loc_m.group(2)
                 if not (ep_base.startswith(loc_path) or loc_path == "/"):
                     continue
                 if len(loc_path) <= best_match_len:
-                    continue  # less specific than current best
+                    continue
                 best_match_len = len(loc_path)
                 has_auth   = bool(re.search(r'AuthType\s+\S+', block, re.IGNORECASE))
-                has_req    = bool(re.search(r'Require\s+valid-user', block, re.IGNORECASE))
+                # Axis OS uses "Require axis-group <group>" instead of "Require valid-user"
+                has_req    = bool(re.search(
+                    r'Require\s+(valid-user|axis-group\s+\S+)', block, re.IGNORECASE
+                ))
                 all_denied = bool(re.search(r'Require\s+all\s+denied', block, re.IGNORECASE))
                 conf_lines = block.strip().splitlines()[:6]
-                conf_snip  = "\n".join([f"# {conf_file.name}  <Location {loc_path}>"] + conf_lines)
+                conf_snip  = "\n".join(
+                    [f"# {conf_file.name}  <Location {loc_path}>"] + conf_lines
+                )
                 if all_denied:
-                    best_hint  = "auth"
-                    best_label = f"Blocked (Require all denied — {conf_file.name}:{loc_path})"
+                    best_hint      = "auth"
+                    best_label     = f"Blocked (Require all denied — {conf_file.name}:{loc_path})"
                     best_conf_snip = conf_snip
                 elif has_auth and has_req:
-                    best_hint  = "auth"
-                    best_label = f"Authenticated (AuthType+Require in {conf_file.name}:{loc_path})"
+                    best_hint      = "auth"
+                    best_label     = f"Authenticated (AuthType+Require in {conf_file.name}:{loc_path})"
+                    best_conf_snip = conf_snip
+                elif has_req and not has_auth:
+                    # Require axis-group without inline AuthType → inherits global AuthType
+                    best_hint      = "auth"
+                    best_label     = (
+                        f"Authenticated (Require axis-group in {conf_file.name}:{loc_path}"
+                        + (f"; AuthType from {global_auth_conf}" if global_auth_conf else "")
+                        + ")"
+                    )
                     best_conf_snip = conf_snip
                 else:
-                    best_hint  = "unauth"
-                    best_label = f"NO auth directives in <Location {loc_path}> ({conf_file.name})"
+                    best_hint      = "unauth"
+                    best_label     = (
+                        f"NO auth directives in <Location {loc_path}> ({conf_file.name})"
+                    )
                     best_conf_snip = conf_snip
 
     if best_hint is not None:
         hint       = best_hint
         auth_label = best_label
         snippet    = best_conf_snip or snippet
+    elif global_auth_conf:
+        # No Location block matched, but a global AuthType is present — endpoint
+        # inherits authentication from the server-wide setting (Axis OS pattern).
+        hint       = "auth"
+        auth_label = f"Authenticated (inherits global AuthType from {global_auth_conf})"
+        snippet    = snippet or f"# Global auth configured in {global_auth_conf}"
     elif any(re.search(pat, ep, re.IGNORECASE) for pat in VAPIX_UNAUTH_PATTERNS):
         hint       = "unauth"
         auth_label = "NO — historically unauthenticated (pattern match; verify with live device)"
