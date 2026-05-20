@@ -215,6 +215,43 @@ def credential_severity(base_severity: str, label: str, fpath: Path) -> tuple:
         return HIGH, " [requires firmware image or local filesystem access]"
     return base_severity, " [requires firmware image or local filesystem access]"
 
+# ── Credential false-positive suppression ────────────────────────────────────
+#
+# Each rule is (filename_regex, matched_content_regex).
+# When BOTH match a finding it is silently dropped.
+#
+# Rationale for each rule:
+#   par_*.conf        — "accessControl = admin" is a VAPIX parameter ACL schema
+#                       field (admin/operator/viewer access level), not a secret.
+#   nsswitch.conf     — "passwd: files systemd" is an NSS database-lookup directive.
+#   com.axis.*.xml    — "@passwd" / "@clear_passwd" are D-Bus argument names in
+#                       auto-generated interface documentation XML.
+#   httpd.conf        — Apache ServerAdmin / ServerRoot / DocumentRoot directives
+#                       contain the words "admin" / "root" as keywords, not values.
+#   limited_access /  — _allow_root, _exec_as_root, _deprecated_access are shell
+#   adp.sh              boolean flag variable names, not credential assignments.
+#   *.min.js /        — Minified JS and known libraries produce too many substring
+#   showdown*.js        hits on variable names like "secret", "token", "root".
+
+FALSE_POSITIVE_RULES = [
+    (r'^par_[^/]*\.conf$',          r'^\s*accessControl\s*='),
+    (r'^nsswitch\.conf$',           r'^\s*passwd\s*:'),
+    (r'^com\.axis\.[^/]*\.xml$',    r'@(passwd|clear_passwd)\b'),
+    (r'^httpd\.conf$',              r'#\s*(ServerAdmin|ServerRoot|DocumentRoot)\b'),
+    (r'^(limited_access|adp)\.sh$', r'(_allow_root|_exec_as_root|_deprecated_access)\s*[=!]'),
+    (r'\.min\.js$',                 r'.*'),
+    (r'^showdown[^/]*\.js$',        r'.*'),
+]
+
+def is_false_positive(fpath: str, matched_content: str) -> bool:
+    """Return True when the finding matches a known false positive rule."""
+    fname = Path(fpath).name
+    for fname_pat, content_pat in FALSE_POSITIVE_RULES:
+        if re.search(fname_pat, fname, re.IGNORECASE):
+            if content_pat == r'.*' or re.search(content_pat, matched_content, re.IGNORECASE):
+                return True
+    return False
+
 # ── Helper utilities ──────────────────────────────────────────────────────────
 
 def _c(text, color):
@@ -366,12 +403,13 @@ def _build_rich_tree(node, path, depth, max_depth, max_entries, _c=[0]):
 # ── Finding class ─────────────────────────────────────────────────────────────
 
 class Finding:
-    def __init__(self, category, severity, path, detail, line=None):
+    def __init__(self, category, severity, path, detail, line=None, evidence=None):
         self.category = category
         self.severity = severity
         self.path = str(path)
         self.detail = detail
         self.line = line
+        self.evidence = evidence
 
     def sort_key(self):
         return SEVERITY_ORDER.get(self.severity, 99)
@@ -499,6 +537,10 @@ def find_credentials(root: Path):
                 parts = line.split(":", 2)
                 fpath_str = parts[0] if len(parts) >= 1 else "?"
                 matched   = parts[2].strip() if len(parts) >= 3 else line
+
+                if is_false_positive(fpath_str, matched):
+                    continue
+
                 redacted  = re.sub(r'([=:]\s*)(\S+)', r'\1[REDACTED]', matched)
 
                 sev, note = credential_severity(base_severity, label, Path(fpath_str))
@@ -689,6 +731,91 @@ def find_init_scripts(root: Path):
     return findings
 
 
+def get_vapix_auth_evidence(ep: str, ref_fpath: str, ref_lineno: str, root: Path) -> tuple:
+    """
+    Return (snippet, auth_label, hint) for a VAPIX endpoint reference.
+
+    hint is one of 'auth', 'unauth', or 'unknown'.
+
+    Strategy:
+      1. Parse Apache2 conf files in etc/apache2 for <Location> blocks covering the
+         endpoint path.  The most-specific (longest) matching block wins.
+         - If the block contains AuthType + Require valid-user → hint='auth'
+         - If the block has Require all denied             → hint='auth'
+         - If the block exists with no auth directives    → hint='unauth'
+      2. Fall back to VAPIX_UNAUTH_PATTERNS if no Apache config match.
+      3. Always try to return surrounding source lines as additional context.
+    """
+    hint       = "unknown"
+    auth_label = "Unknown — verify with live device or Apache2 config"
+    snippet    = ""
+
+    # --- source context window ---
+    if ref_fpath and ref_fpath != "?" and ref_lineno and ref_lineno.isdigit():
+        ln    = int(ref_lineno)
+        start = max(1, ln - 2)
+        end   = ln + 2
+        out, _, _ = run_cmd(f'sed -n "{start},{end}p" "{ref_fpath}" 2>/dev/null')
+        if out.strip():
+            snippet = out.strip()[:300]
+
+    # --- Apache2 config scan ---
+    apache_dirs = [root / "etc" / "apache2", root / "etc" / "httpd"]
+    ep_base     = ep.split("?")[0].rstrip("/") or "/"
+
+    best_match_len = -1
+    best_hint   = None
+    best_label  = None
+    best_conf_snip = None
+
+    for apache_dir in apache_dirs:
+        if not apache_dir.is_dir():
+            continue
+        for conf_file in sorted(apache_dir.rglob("*.conf")):
+            try:
+                conf_content = conf_file.read_text(errors="replace")
+            except (IOError, OSError):
+                continue
+            for loc_m in re.finditer(
+                r'<Location\s+([^>]+)>(.*?)</Location>',
+                conf_content, re.IGNORECASE | re.DOTALL
+            ):
+                loc_path  = loc_m.group(1).strip().rstrip("/") or "/"
+                block     = loc_m.group(2)
+                if not (ep_base.startswith(loc_path) or loc_path == "/"):
+                    continue
+                if len(loc_path) <= best_match_len:
+                    continue  # less specific than current best
+                best_match_len = len(loc_path)
+                has_auth   = bool(re.search(r'AuthType\s+\S+', block, re.IGNORECASE))
+                has_req    = bool(re.search(r'Require\s+valid-user', block, re.IGNORECASE))
+                all_denied = bool(re.search(r'Require\s+all\s+denied', block, re.IGNORECASE))
+                conf_lines = block.strip().splitlines()[:6]
+                conf_snip  = "\n".join([f"# {conf_file.name}  <Location {loc_path}>"] + conf_lines)
+                if all_denied:
+                    best_hint  = "auth"
+                    best_label = f"Blocked (Require all denied — {conf_file.name}:{loc_path})"
+                    best_conf_snip = conf_snip
+                elif has_auth and has_req:
+                    best_hint  = "auth"
+                    best_label = f"Authenticated (AuthType+Require in {conf_file.name}:{loc_path})"
+                    best_conf_snip = conf_snip
+                else:
+                    best_hint  = "unauth"
+                    best_label = f"NO auth directives in <Location {loc_path}> ({conf_file.name})"
+                    best_conf_snip = conf_snip
+
+    if best_hint is not None:
+        hint       = best_hint
+        auth_label = best_label
+        snippet    = best_conf_snip or snippet
+    elif any(re.search(pat, ep, re.IGNORECASE) for pat in VAPIX_UNAUTH_PATTERNS):
+        hint       = "unauth"
+        auth_label = "NO — historically unauthenticated (pattern match; verify with live device)"
+
+    return snippet, auth_label, hint
+
+
 def find_vapix_endpoints(root: Path):
     _info("Scanning for VAPIX / axis-cgi endpoints...")
     findings = []
@@ -702,19 +829,38 @@ def find_vapix_endpoints(root: Path):
         f'grep -rn {grep_exts} -E "axis-cgi|vapix|VAPIX" "{root}" 2>/dev/null | head -300'
     )
 
-    seen = set()
+    # endpoint → (first_fpath, first_lineno) — keep the first reference found
+    endpoint_refs: dict = {}
     for line in stdout.splitlines():
-        match = re.search(r'(/axis-cgi/[^\s"\'<>&,;)]+)', line)
-        if not match:
+        m_ref = re.match(r'^(.+?):(\d+):(.*)', line)
+        if not m_ref:
             continue
-        ep = match.group(1).rstrip(".,;)")
-        if ep in seen:
+        fpath, lineno, content = m_ref.group(1), m_ref.group(2), m_ref.group(3)
+        m_ep = re.search(r'(/axis-cgi/[^\s"\'<>&,;)]+)', content)
+        if not m_ep:
             continue
-        seen.add(ep)
-        is_unauth = any(re.search(pat, ep, re.IGNORECASE) for pat in VAPIX_UNAUTH_PATTERNS)
-        severity = CRITICAL if is_unauth else MEDIUM
-        auth_status = "NO — unauthenticated access possible" if is_unauth else "Unknown (verify)"
-        findings.append(Finding("VAPIX Endpoint", severity, ep, f"Authenticated: {auth_status}"))
+        ep = m_ep.group(1).rstrip(".,;)")
+        if ep not in endpoint_refs:
+            endpoint_refs[ep] = (fpath, lineno)
+
+    for ep, (ref_fpath, ref_lineno) in endpoint_refs.items():
+        evidence_snip, auth_label, hint = get_vapix_auth_evidence(
+            ep, ref_fpath, ref_lineno, root
+        )
+        if hint == "auth":
+            severity = LOW
+        elif hint == "unauth":
+            severity = CRITICAL
+        else:
+            severity = MEDIUM
+
+        ref_str = f"{Path(ref_fpath).name}:{ref_lineno}" if ref_fpath != "?" else "?"
+        findings.append(Finding(
+            "VAPIX Endpoint", severity, ep,
+            auth_label,
+            line=ref_str,
+            evidence=evidence_snip or None,
+        ))
 
     # Check for param → shell patterns near VAPIX handler code
     stdout2, _, _ = run_cmd(
@@ -1153,10 +1299,26 @@ def build_markdown_report(findings, target, diff_data, compare):
     ve = findings_of("VAPIX Endpoint", "VAPIX Shell Risk", "VAPIX Shell Injection")
     L += ["## VAPIX Endpoints", ""]
     if ve:
-        L += ["| Severity | Endpoint / Location | Detail |",
-              "|----------|---------------------|--------|"]
+        L += ["| Severity | Endpoint / Location | Auth Status | Source Ref |",
+              "|----------|---------------------|-------------|------------|"]
         for f in ve:
-            L.append(f"| {badge(f.severity)} {f.severity} | `{f.path}` | {f.detail} |")
+            ref = f.line or "—"
+            L.append(f"| {badge(f.severity)} {f.severity} | `{f.path}` | {f.detail} | `{ref}` |")
+        # Evidence snippets for unauthenticated / unknown endpoints
+        evidence_items = [
+            f for f in ve
+            if getattr(f, "evidence", None) and f.severity in (CRITICAL, MEDIUM)
+        ]
+        if evidence_items:
+            L += ["", "### Evidence", ""]
+            for f in evidence_items[:10]:
+                L += [
+                    f"**`{f.path}`** — {f.detail}",
+                    "```",
+                    (f.evidence or "")[:500],
+                    "```",
+                    "",
+                ]
     else:
         L.append("_No VAPIX endpoints detected._")
     L.append("")
@@ -1304,7 +1466,8 @@ def build_json_report(findings, target, diff_data, compare):
         "summary": count_by_severity(findings),
         "findings": [
             {"category": f.category, "severity": f.severity,
-             "path": f.path, "detail": f.detail, "line": f.line}
+             "path": f.path, "detail": f.detail, "line": f.line,
+             "evidence": getattr(f, "evidence", None)}
             for f in sorted(findings, key=lambda x: x.sort_key())
         ],
         "diff": diff_data,
