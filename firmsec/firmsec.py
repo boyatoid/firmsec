@@ -215,6 +215,134 @@ def credential_severity(base_severity: str, label: str, fpath: Path) -> tuple:
         return HIGH, " [requires firmware image or local filesystem access]"
     return base_severity, " [requires firmware image or local filesystem access]"
 
+# ── Credential false-positive suppression ────────────────────────────────────
+#
+# Each rule is (filename_regex, matched_content_regex).
+# When BOTH match a finding it is silently dropped.
+#
+# Rationale for each rule:
+#   par_*.conf        — "accessControl = admin" is a VAPIX parameter ACL schema
+#                       field (admin/operator/viewer access level), not a secret.
+#   nsswitch.conf     — "passwd: files systemd" is an NSS database-lookup directive.
+#   com.axis.*.xml    — "@passwd" / "@clear_passwd" are D-Bus argument names in
+#                       auto-generated interface documentation XML.
+#   httpd.conf        — Apache ServerAdmin / ServerRoot / DocumentRoot directives
+#                       contain the words "admin" / "root" as keywords, not values.
+#   limited_access /  — _allow_root, _exec_as_root, _deprecated_access are shell
+#   adp.sh              boolean flag variable names, not credential assignments.
+#   *.min.js /        — Minified JS and known libraries produce too many substring
+#   showdown*.js        hits on variable names like "secret", "token", "root".
+
+FALSE_POSITIVE_RULES = [
+    # VAPIX legacymappings XML — accessControl ACL values like "admin:3;operator:3;viewer:1"
+    # are numeric permission levels, not credential values.
+    # The match key is the content pattern; we apply this to all XML files.
+    (r'\.xml$',                      r'name=["\']?accessControl["\']?'),
+    # par_*.conf — VAPIX parameter schema files:
+    #   "accessControl = admin"  → ACL level enum, not a secret
+    #   "type = password:writeonly"  → parameter type annotation, not a value
+    (r'^par_[^/]*\.conf$',          r'^\s*accessControl\s*=|^\s*type\s*=\s*"?password'),
+    (r'^nsswitch\.conf$',           r'^\s*passwd\s*:'),
+    # com.axis.*.xml — D-Bus interface documentation:
+    #   "@passwd" / "@clear_passwd" / "@username" are argument names, not values
+    #   "<arg … name=\"username\"" is XML schema, not a credential
+    (r'^com\.axis\.[^/]*\.xml$',    r'@(passwd|clear_passwd|username)\b|name="(username|passwd)"'),
+    (r'^httpd\.conf$',              r'#\s*(ServerAdmin|ServerRoot|DocumentRoot)\b'),
+    (r'^(limited_access|adp)\.sh$', r'(_allow_root|_exec_as_root|_deprecated_access)\s*[=!]'),
+    (r'\.min\.js$',                 r'.*'),
+    (r'^showdown[^/]*\.js$',        r'.*'),
+]
+
+def is_false_positive(fpath: str, matched_content: str) -> bool:
+    """Return True when the finding matches a known false positive rule."""
+    fname = Path(fpath).name
+    for fname_pat, content_pat in FALSE_POSITIVE_RULES:
+        if re.search(fname_pat, fname, re.IGNORECASE):
+            if content_pat == r'.*' or re.search(content_pat, matched_content, re.IGNORECASE):
+                return True
+    return False
+
+
+# ── Credential value quality filter ──────────────────────────────────────────
+#
+# The grep patterns match any non-whitespace value after "password =", "token =",
+# etc. — which includes sed patterns, shell variable references, chown args, type
+# annotations, and other incidental matches that are clearly not real secrets.
+#
+# _is_credlike() extracts the value portion and returns False if it is obviously
+# not a real credential, so those findings are silently dropped.
+
+# Line-level check: if the whole line is a command invocation, the "=" match is
+# incidental (e.g. sed / chown / awk argument that happens to contain the keyword).
+_COMMAND_LINE_RE = re.compile(
+    r'^\s*(?:sed|awk|grep|find|chown|chmod|chgrp|xargs|echo|printf|export|'
+    r'logger|install|cp|mv|ln)\s',
+    re.IGNORECASE,
+)
+
+# Value-level check: patterns that are definitely not real credential values.
+_NON_CRED_VALUE_RE = re.compile(
+    r'^(?:'
+    r'""|\'\''                                          # empty string literals
+    r'|false|true|yes|no|on|off|enabled|disabled'       # booleans
+    r'|null|none|nil|n/?a|undefined|unset|empty'        # null-like
+    r'|0+(?:\.0+)?'                                     # zero / 0.0
+    r'|\$[\({]\S*|\$[A-Za-z_]\w*'                      # $VAR  ${VAR}  $(cmd)
+    r'|`[^`]*`'                                         # `backtick substitution`
+    r'|%[sdifgqr]|%\{\w+\}|\{[\w._:-]+\}'              # printf / Jinja / Python fmt
+    r'|<[\w/_ -]+>'                                     # <placeholder>
+    r'|\*{2,}|x{4,}|-{4,}|\.{3,}'                     # masking: **** xxxx ----
+    r'|changeme|change[-_]?me|tbd|todo|fixme|set[-_]?this'
+    r'|writeonly|readonly|maxlen|minlen|type'            # type-annotation keywords
+    r'|basic|digest|bearer|ntlm|negotiate|kerberos|oauth\d?'  # auth method names
+    r'|/[\w/.-]{3,}'                                   # file paths
+    r'|\w+:\w+'                                        # user:group pairs (chown)
+    r'|\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}'           # IP addresses
+    r').*$',
+    re.IGNORECASE,
+)
+
+# Case-sensitive: purely uppercase-plus-underscores identifiers like
+# PTZ_AUTO_PT_CALIBRATION are system constants, not credential values.
+_ALL_CAPS_IDENTIFIER_RE = re.compile(r'^[A-Z][A-Z0-9]{1,}_[A-Z0-9_]+$')
+
+
+def _is_credlike(matched_line: str) -> bool:
+    """
+    Return True only when matched_line plausibly contains a real credential value.
+
+    Rejects:
+      - Command invocations (sed / chown / awk / …) where the keyword match is
+        incidental to the command syntax.
+      - Values that are shell substitutions, variable references, regex metachar
+        sequences, type annotations, boolean/null keywords, masking placeholders,
+        auth method names, file paths, or user:group pairs.
+      - Purely ALL_CAPS_WITH_UNDERSCORES system constant identifiers.
+      - Values shorter than 4 characters (too short to be meaningful).
+    """
+    if _COMMAND_LINE_RE.search(matched_line):
+        return False
+
+    # Extract the value portion after the first = or :
+    m = re.search(r'[=:]\s*["\']?(.*?)["\']?\s*(?:#.*)?$', matched_line.strip())
+    if not m:
+        return False
+    value = m.group(1).strip().strip('"\'').strip()
+
+    if len(value) < 4:
+        return False
+    # Regex metacharacters → sed/grep pattern context, not a credential
+    if re.search(r'\.\*|\\\d|\\\w|\(\?', value):
+        return False
+    # Case-insensitive keyword / structural checks
+    if _NON_CRED_VALUE_RE.match(value):
+        return False
+    # Case-sensitive: purely uppercase identifier with underscore separator
+    if _ALL_CAPS_IDENTIFIER_RE.match(value):
+        return False
+    return True
+
+
 # ── Helper utilities ──────────────────────────────────────────────────────────
 
 def _c(text, color):
@@ -366,12 +494,13 @@ def _build_rich_tree(node, path, depth, max_depth, max_entries, _c=[0]):
 # ── Finding class ─────────────────────────────────────────────────────────────
 
 class Finding:
-    def __init__(self, category, severity, path, detail, line=None):
+    def __init__(self, category, severity, path, detail, line=None, evidence=None):
         self.category = category
         self.severity = severity
         self.path = str(path)
         self.detail = detail
         self.line = line
+        self.evidence = evidence
 
     def sort_key(self):
         return SEVERITY_ORDER.get(self.severity, 99)
@@ -396,6 +525,7 @@ def step_analyze(extract_dir: Path, kali: bool):
     findings += analyze_webserver_configs(extract_dir)
     findings += find_network_services(extract_dir)
     findings += axis_specific_checks(extract_dir)
+    findings += cross_reference_unauth_rce(findings)
 
     _ok(f"Analysis complete. {len(findings)} findings.")
     return findings
@@ -499,6 +629,16 @@ def find_credentials(root: Path):
                 parts = line.split(":", 2)
                 fpath_str = parts[0] if len(parts) >= 1 else "?"
                 matched   = parts[2].strip() if len(parts) >= 3 else line
+
+                if not Path(fpath_str).is_file():
+                    continue  # grep parsing artifact — path does not exist
+
+                if is_false_positive(fpath_str, matched):
+                    continue
+
+                if not _is_credlike(matched):
+                    continue
+
                 redacted  = re.sub(r'([=:]\s*)(\S+)', r'\1[REDACTED]', matched)
 
                 sev, note = credential_severity(base_severity, label, Path(fpath_str))
@@ -689,6 +829,126 @@ def find_init_scripts(root: Path):
     return findings
 
 
+def get_vapix_auth_evidence(ep: str, ref_fpath: str, ref_lineno: str, root: Path) -> tuple:
+    """
+    Return (snippet, auth_label, hint) for a VAPIX endpoint reference.
+
+    hint is one of 'auth', 'unauth', or 'unknown'.
+
+    Strategy:
+      1. Scan Apache2 conf files for <Location>/<LocationMatch> blocks covering the
+         endpoint path. Most-specific (longest) matching block wins.
+         - AuthType + Require (valid-user OR axis-group) → hint='auth'
+         - Require all denied                            → hint='auth'
+         - Location block with no auth directives        → hint='unauth'
+      2. If no Location block matches, check for a global AuthType directive in
+         any Apache conf file (outside a Location block) — Axis OS 11.x sets
+         AuthType Digest globally in httpd-digest.conf; endpoints that don't
+         have their own Location block inherit this.
+      3. Fall back to VAPIX_UNAUTH_PATTERNS pattern matching.
+      4. Always return surrounding source lines as additional context.
+    """
+    hint       = "unknown"
+    auth_label = "Unknown — verify with live device or Apache2 config"
+    snippet    = ""
+
+    # --- source context window ---
+    if ref_fpath and ref_fpath != "?" and ref_lineno and ref_lineno.isdigit():
+        ln    = int(ref_lineno)
+        start = max(1, ln - 2)
+        end   = ln + 2
+        out, _, _ = run_cmd(f'sed -n "{start},{end}p" "{ref_fpath}" 2>/dev/null')
+        if out.strip():
+            snippet = out.strip()[:300]
+
+    # --- Apache2 config scan ---
+    apache_dirs = [root / "etc" / "apache2", root / "etc" / "httpd"]
+    ep_base     = ep.split("?")[0].rstrip("/") or "/"
+
+    best_match_len = -1
+    best_hint      = None
+    best_label     = None
+    best_conf_snip = None
+    global_auth_conf = None   # file that carries a bare AuthType directive
+
+    for apache_dir in apache_dirs:
+        if not apache_dir.is_dir():
+            continue
+        for conf_file in sorted(apache_dir.rglob("*.conf")):
+            try:
+                conf_content = conf_file.read_text(errors="replace")
+            except (IOError, OSError):
+                continue
+
+            # Detect bare (non-Location-wrapped) global AuthType
+            # Axis OS uses httpd-digest.conf / httpd-basic.conf at the top level.
+            bare_auth = re.search(r'(?m)^AuthType\s+\S+', conf_content)
+            if bare_auth and not re.search(r'<Location', conf_content, re.IGNORECASE):
+                global_auth_conf = conf_file.name
+
+            # Scan <Location> and <LocationMatch> blocks
+            for loc_m in re.finditer(
+                r'<Location(?:Match)?\s+([^>]+)>(.*?)</Location(?:Match)?>',
+                conf_content, re.IGNORECASE | re.DOTALL
+            ):
+                loc_path  = loc_m.group(1).strip().strip('"').rstrip("/") or "/"
+                block     = loc_m.group(2)
+                if not (ep_base.startswith(loc_path) or loc_path == "/"):
+                    continue
+                if len(loc_path) <= best_match_len:
+                    continue
+                best_match_len = len(loc_path)
+                has_auth   = bool(re.search(r'AuthType\s+\S+', block, re.IGNORECASE))
+                # Axis OS uses "Require axis-group <group>" instead of "Require valid-user"
+                has_req    = bool(re.search(
+                    r'Require\s+(valid-user|axis-group\s+\S+)', block, re.IGNORECASE
+                ))
+                all_denied = bool(re.search(r'Require\s+all\s+denied', block, re.IGNORECASE))
+                conf_lines = block.strip().splitlines()[:6]
+                conf_snip  = "\n".join(
+                    [f"# {conf_file.name}  <Location {loc_path}>"] + conf_lines
+                )
+                if all_denied:
+                    best_hint      = "auth"
+                    best_label     = f"Blocked (Require all denied — {conf_file.name}:{loc_path})"
+                    best_conf_snip = conf_snip
+                elif has_auth and has_req:
+                    best_hint      = "auth"
+                    best_label     = f"Authenticated (AuthType+Require in {conf_file.name}:{loc_path})"
+                    best_conf_snip = conf_snip
+                elif has_req and not has_auth:
+                    # Require axis-group without inline AuthType → inherits global AuthType
+                    best_hint      = "auth"
+                    best_label     = (
+                        f"Authenticated (Require axis-group in {conf_file.name}:{loc_path}"
+                        + (f"; AuthType from {global_auth_conf}" if global_auth_conf else "")
+                        + ")"
+                    )
+                    best_conf_snip = conf_snip
+                else:
+                    best_hint      = "unauth"
+                    best_label     = (
+                        f"NO auth directives in <Location {loc_path}> ({conf_file.name})"
+                    )
+                    best_conf_snip = conf_snip
+
+    if best_hint is not None:
+        hint       = best_hint
+        auth_label = best_label
+        snippet    = best_conf_snip or snippet
+    elif global_auth_conf:
+        # No Location block matched, but a global AuthType is present — endpoint
+        # inherits authentication from the server-wide setting (Axis OS pattern).
+        hint       = "auth"
+        auth_label = f"Authenticated (inherits global AuthType from {global_auth_conf})"
+        snippet    = snippet or f"# Global auth configured in {global_auth_conf}"
+    elif any(re.search(pat, ep, re.IGNORECASE) for pat in VAPIX_UNAUTH_PATTERNS):
+        hint       = "unauth"
+        auth_label = "NO — historically unauthenticated (pattern match; verify with live device)"
+
+    return snippet, auth_label, hint
+
+
 def find_vapix_endpoints(root: Path):
     _info("Scanning for VAPIX / axis-cgi endpoints...")
     findings = []
@@ -702,19 +962,38 @@ def find_vapix_endpoints(root: Path):
         f'grep -rn {grep_exts} -E "axis-cgi|vapix|VAPIX" "{root}" 2>/dev/null | head -300'
     )
 
-    seen = set()
+    # endpoint → (first_fpath, first_lineno) — keep the first reference found
+    endpoint_refs: dict = {}
     for line in stdout.splitlines():
-        match = re.search(r'(/axis-cgi/[^\s"\'<>&,;)]+)', line)
-        if not match:
+        m_ref = re.match(r'^(.+?):(\d+):(.*)', line)
+        if not m_ref:
             continue
-        ep = match.group(1).rstrip(".,;)")
-        if ep in seen:
+        fpath, lineno, content = m_ref.group(1), m_ref.group(2), m_ref.group(3)
+        m_ep = re.search(r'(/axis-cgi/[^\s"\'<>&,;)]+)', content)
+        if not m_ep:
             continue
-        seen.add(ep)
-        is_unauth = any(re.search(pat, ep, re.IGNORECASE) for pat in VAPIX_UNAUTH_PATTERNS)
-        severity = CRITICAL if is_unauth else MEDIUM
-        auth_status = "NO — unauthenticated access possible" if is_unauth else "Unknown (verify)"
-        findings.append(Finding("VAPIX Endpoint", severity, ep, f"Authenticated: {auth_status}"))
+        ep = m_ep.group(1).rstrip(".,;)")
+        if ep not in endpoint_refs:
+            endpoint_refs[ep] = (fpath, lineno)
+
+    for ep, (ref_fpath, ref_lineno) in endpoint_refs.items():
+        evidence_snip, auth_label, hint = get_vapix_auth_evidence(
+            ep, ref_fpath, ref_lineno, root
+        )
+        if hint == "auth":
+            severity = LOW
+        elif hint == "unauth":
+            severity = CRITICAL
+        else:
+            severity = MEDIUM
+
+        ref_str = f"{Path(ref_fpath).name}:{ref_lineno}" if ref_fpath != "?" else "?"
+        findings.append(Finding(
+            "VAPIX Endpoint", severity, ep,
+            auth_label,
+            line=ref_str,
+            evidence=evidence_snip or None,
+        ))
 
     # Check for param → shell patterns near VAPIX handler code
     stdout2, _, _ = run_cmd(
@@ -1018,6 +1297,93 @@ def axis_specific_checks(root: Path):
     return findings
 
 
+# ── Cross-reference: unauthenticated endpoints × RCE-risky scripts ────────────
+
+def cross_reference_unauth_rce(findings: list) -> list:
+    """
+    Surface confirmed attack paths: CRITICAL (unauthenticated) VAPIX endpoints
+    that map to CGI/shell scripts with RCE-class risk flags.
+
+    Matching is attempted at three confidence levels:
+      HIGH   — filesystem path of script ends with the endpoint URL tail
+               e.g. .../axis-cgi/foo.cgi matches /axis-cgi/foo.cgi
+      MEDIUM — script filename matches the last path segment of the endpoint
+               e.g. foo.cgi matches /axis-cgi/subdir/foo.cgi
+      LOW    — the endpoint URL string appears literally inside the script source
+
+    Returns new Finding("Unauthenticated RCE Path", CRITICAL, ...) entries.
+    These are intentionally additive — the individual VAPIX and script findings
+    are left unchanged with their own severities.
+    """
+    _info("Cross-referencing unauthenticated endpoints with RCE-risky scripts...")
+
+    unauth_eps = [
+        f for f in findings
+        if f.category == "VAPIX Endpoint" and f.severity == CRITICAL
+    ]
+    risky_scripts = [
+        f for f in findings
+        if f.category in ("CGI Script", "Shell Script")
+        and f.severity in (CRITICAL, HIGH)
+        and any(flag in (f.detail or "")
+                for flag in ["backtick+CGI", "shell-exec", "user-input→shell"])
+    ]
+
+    results = []
+    seen = set()   # (ep_url, script_path) — avoid duplicates
+
+    for ep in unauth_eps:
+        ep_url  = ep.path                            # /axis-cgi/foo/bar.cgi
+        ep_tail = ep_url.lstrip("/")                 # axis-cgi/foo/bar.cgi
+        ep_name = Path(ep_url).name                  # bar.cgi
+
+        for script in risky_scripts:
+            sp = script.path
+            key = (ep_url, sp)
+            if key in seen:
+                continue
+
+            confidence = None
+            if sp.endswith(ep_tail):
+                confidence = "HIGH"
+            elif Path(sp).name == ep_name:
+                confidence = "MEDIUM"
+            else:
+                try:
+                    if ep_url in Path(sp).read_text(errors="replace"):
+                        confidence = "LOW"
+                except (IOError, OSError):
+                    pass
+
+            if not confidence:
+                continue
+            seen.add(key)
+
+            # Extract risk flags from script detail string
+            flags_raw = re.search(r'\[([^\]]+)\]', script.detail or "")
+            risk_flags = flags_raw.group(1) if flags_raw else script.detail[:60]
+
+            auth_short = (ep.detail or "")[:80]
+
+            # Combine evidence: auth config snippet + script risk detail
+            ev_parts = []
+            if ep.evidence:
+                ev_parts.append(f"[Auth evidence — {ep.line or ep_url}]\n{ep.evidence}")
+            ev_parts.append(f"[Script risk flags]\n{risk_flags}\nScript: {sp}")
+            combined_evidence = "\n\n".join(ev_parts)
+
+            results.append(Finding(
+                "Unauthenticated RCE Path", CRITICAL, sp,
+                f"[{confidence}] {ep_url} is unauthenticated ({auth_short}) "
+                f"and script has RCE-class flags: {risk_flags}",
+                line=ep_url,
+                evidence=combined_evidence,
+            ))
+
+    _ok(f"Cross-reference: {len(results)} critical attack path(s) found")
+    return results
+
+
 # ── Diff mode ─────────────────────────────────────────────────────────────────
 
 def step_diff(dir_a: Path, dir_b: Path):
@@ -1087,7 +1453,7 @@ def build_markdown_report(findings, target, diff_data, compare):
         "",
         f"> Generated: {now}  ",
         f"> Target: `{target}`  ",
-        f"> Tool: FirmSec v1.2 (Axis OS Firmware Security Analyzer)",
+        f"> Tool: FirmSec v1.3 (Axis OS Firmware Security Analyzer)",
         "",
     ]
 
@@ -1111,6 +1477,43 @@ def build_markdown_report(findings, target, diff_data, compare):
     if counts[CRITICAL] > 0:
         L.append(f"> ⚠️ **{counts[CRITICAL]} CRITICAL findings require immediate attention.**")
         L.append("")
+
+    # ── Critical Attack Paths (cross-reference) ────────────────────────────────
+    rce_paths = findings_of("Unauthenticated RCE Path")
+    if rce_paths:
+        L += [
+            "## 🔴 Critical Attack Paths Found",
+            "",
+            "> **These endpoints are reachable without authentication AND the backing script",
+            "> contains code execution patterns. Treat as highest-priority for immediate",
+            "> remediation or network-level firewall isolation.**",
+            "",
+            "| Confidence | Unauthenticated Endpoint | Script | RCE Risk Flags |",
+            "|------------|--------------------------|--------|----------------|",
+        ]
+        for f in rce_paths:
+            ep_url     = f.line or "?"
+            script_name = Path(f.path).name
+            conf_m     = re.search(r'^\[(\w+)\]', f.detail)
+            confidence = conf_m.group(1) if conf_m else "?"
+            flags_m    = re.search(r'RCE-class flags: (.+)$', f.detail)
+            risk_flags = flags_m.group(1) if flags_m else "?"
+            L.append(
+                f"| **{confidence}** | `{ep_url}` | `{script_name}` | {risk_flags} |"
+            )
+        L += [""]
+        # Evidence sub-section (capped at 5)
+        L += ["### Evidence", ""]
+        for f in rce_paths[:5]:
+            ep_url = f.line or "?"
+            L += [
+                f"#### `{ep_url}` → `{Path(f.path).name}`",
+                "```",
+                (f.evidence or "")[:700],
+                "```",
+                "",
+            ]
+    L.append("")
 
     # ── Dangerous Functions ────────────────────────────────────────────────────
     df = findings_of("Dangerous Function", "Dangerous Function (binary)")
@@ -1153,10 +1556,26 @@ def build_markdown_report(findings, target, diff_data, compare):
     ve = findings_of("VAPIX Endpoint", "VAPIX Shell Risk", "VAPIX Shell Injection")
     L += ["## VAPIX Endpoints", ""]
     if ve:
-        L += ["| Severity | Endpoint / Location | Detail |",
-              "|----------|---------------------|--------|"]
+        L += ["| Severity | Endpoint / Location | Auth Status | Source Ref |",
+              "|----------|---------------------|-------------|------------|"]
         for f in ve:
-            L.append(f"| {badge(f.severity)} {f.severity} | `{f.path}` | {f.detail} |")
+            ref = f.line or "—"
+            L.append(f"| {badge(f.severity)} {f.severity} | `{f.path}` | {f.detail} | `{ref}` |")
+        # Evidence snippets for unauthenticated / unknown endpoints
+        evidence_items = [
+            f for f in ve
+            if getattr(f, "evidence", None) and f.severity in (CRITICAL, MEDIUM)
+        ]
+        if evidence_items:
+            L += ["", "### Evidence", ""]
+            for f in evidence_items[:10]:
+                L += [
+                    f"**`{f.path}`** — {f.detail}",
+                    "```",
+                    (f.evidence or "")[:500],
+                    "```",
+                    "",
+                ]
     else:
         L.append("_No VAPIX endpoints detected._")
     L.append("")
@@ -1290,21 +1709,22 @@ def build_markdown_report(findings, target, diff_data, compare):
         f"{n+3}. 🔵 Subscribe to Axis security advisories: https://www.axis.com/support/cybersecurity/security-advisories",
     ]
     L += steps
-    L += ["", "---", f"_Report generated by FirmSec v1.2 — {now}_"]
+    L += ["", "---", f"_Report generated by FirmSec v1.3 — {now}_"]
 
     return "\n".join(L)
 
 
 def build_json_report(findings, target, diff_data, compare):
     data = {
-        "tool": "FirmSec v1.2",
+        "tool": "FirmSec v1.3",
         "generated": datetime.now().isoformat(),
         "target": str(target),
         "compare": str(compare) if compare else None,
         "summary": count_by_severity(findings),
         "findings": [
             {"category": f.category, "severity": f.severity,
-             "path": f.path, "detail": f.detail, "line": f.line}
+             "path": f.path, "detail": f.detail, "line": f.line,
+             "evidence": getattr(f, "evidence", None)}
             for f in sorted(findings, key=lambda x: x.sort_key())
         ],
         "diff": diff_data,
@@ -1356,7 +1776,7 @@ def print_terminal_summary(findings):
 def parse_args():
     parser = argparse.ArgumentParser(
         prog="firmsec",
-        description="FirmSec v1.2 — Axis OS Firmware Security Analyzer",
+        description="FirmSec v1.3 — Axis OS Firmware Security Analyzer",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
@@ -1386,13 +1806,13 @@ def main():
 
     if HAS_RICH:
         console.print(Panel.fit(
-            "[bold cyan]FirmSec v1.2[/bold cyan] — Axis OS Firmware Security Analyzer\n"
+            "[bold cyan]FirmSec v1.3[/bold cyan] — Axis OS Firmware Security Analyzer\n"
             "[dim]Optimized for Axis OS | Mac + Kali Linux[/dim]",
             border_style="cyan"
         ))
     else:
         print("=" * 60)
-        print("  FirmSec v1.2 — Axis OS Firmware Security Analyzer")
+        print("  FirmSec v1.3 — Axis OS Firmware Security Analyzer")
         print("=" * 60)
 
     if not target.exists():
