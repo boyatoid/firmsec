@@ -525,6 +525,7 @@ def step_analyze(extract_dir: Path, kali: bool):
     findings += analyze_webserver_configs(extract_dir)
     findings += find_network_services(extract_dir)
     findings += axis_specific_checks(extract_dir)
+    findings += cross_reference_unauth_rce(findings)
 
     _ok(f"Analysis complete. {len(findings)} findings.")
     return findings
@@ -1296,6 +1297,93 @@ def axis_specific_checks(root: Path):
     return findings
 
 
+# ── Cross-reference: unauthenticated endpoints × RCE-risky scripts ────────────
+
+def cross_reference_unauth_rce(findings: list) -> list:
+    """
+    Surface confirmed attack paths: CRITICAL (unauthenticated) VAPIX endpoints
+    that map to CGI/shell scripts with RCE-class risk flags.
+
+    Matching is attempted at three confidence levels:
+      HIGH   — filesystem path of script ends with the endpoint URL tail
+               e.g. .../axis-cgi/foo.cgi matches /axis-cgi/foo.cgi
+      MEDIUM — script filename matches the last path segment of the endpoint
+               e.g. foo.cgi matches /axis-cgi/subdir/foo.cgi
+      LOW    — the endpoint URL string appears literally inside the script source
+
+    Returns new Finding("Unauthenticated RCE Path", CRITICAL, ...) entries.
+    These are intentionally additive — the individual VAPIX and script findings
+    are left unchanged with their own severities.
+    """
+    _info("Cross-referencing unauthenticated endpoints with RCE-risky scripts...")
+
+    unauth_eps = [
+        f for f in findings
+        if f.category == "VAPIX Endpoint" and f.severity == CRITICAL
+    ]
+    risky_scripts = [
+        f for f in findings
+        if f.category in ("CGI Script", "Shell Script")
+        and f.severity in (CRITICAL, HIGH)
+        and any(flag in (f.detail or "")
+                for flag in ["backtick+CGI", "shell-exec", "user-input→shell"])
+    ]
+
+    results = []
+    seen = set()   # (ep_url, script_path) — avoid duplicates
+
+    for ep in unauth_eps:
+        ep_url  = ep.path                            # /axis-cgi/foo/bar.cgi
+        ep_tail = ep_url.lstrip("/")                 # axis-cgi/foo/bar.cgi
+        ep_name = Path(ep_url).name                  # bar.cgi
+
+        for script in risky_scripts:
+            sp = script.path
+            key = (ep_url, sp)
+            if key in seen:
+                continue
+
+            confidence = None
+            if sp.endswith(ep_tail):
+                confidence = "HIGH"
+            elif Path(sp).name == ep_name:
+                confidence = "MEDIUM"
+            else:
+                try:
+                    if ep_url in Path(sp).read_text(errors="replace"):
+                        confidence = "LOW"
+                except (IOError, OSError):
+                    pass
+
+            if not confidence:
+                continue
+            seen.add(key)
+
+            # Extract risk flags from script detail string
+            flags_raw = re.search(r'\[([^\]]+)\]', script.detail or "")
+            risk_flags = flags_raw.group(1) if flags_raw else script.detail[:60]
+
+            auth_short = (ep.detail or "")[:80]
+
+            # Combine evidence: auth config snippet + script risk detail
+            ev_parts = []
+            if ep.evidence:
+                ev_parts.append(f"[Auth evidence — {ep.line or ep_url}]\n{ep.evidence}")
+            ev_parts.append(f"[Script risk flags]\n{risk_flags}\nScript: {sp}")
+            combined_evidence = "\n\n".join(ev_parts)
+
+            results.append(Finding(
+                "Unauthenticated RCE Path", CRITICAL, sp,
+                f"[{confidence}] {ep_url} is unauthenticated ({auth_short}) "
+                f"and script has RCE-class flags: {risk_flags}",
+                line=ep_url,
+                evidence=combined_evidence,
+            ))
+
+    _ok(f"Cross-reference: {len(results)} critical attack path(s) found")
+    return results
+
+
 # ── Diff mode ─────────────────────────────────────────────────────────────────
 
 def step_diff(dir_a: Path, dir_b: Path):
@@ -1365,7 +1453,7 @@ def build_markdown_report(findings, target, diff_data, compare):
         "",
         f"> Generated: {now}  ",
         f"> Target: `{target}`  ",
-        f"> Tool: FirmSec v1.2 (Axis OS Firmware Security Analyzer)",
+        f"> Tool: FirmSec v1.3 (Axis OS Firmware Security Analyzer)",
         "",
     ]
 
@@ -1389,6 +1477,43 @@ def build_markdown_report(findings, target, diff_data, compare):
     if counts[CRITICAL] > 0:
         L.append(f"> ⚠️ **{counts[CRITICAL]} CRITICAL findings require immediate attention.**")
         L.append("")
+
+    # ── Critical Attack Paths (cross-reference) ────────────────────────────────
+    rce_paths = findings_of("Unauthenticated RCE Path")
+    if rce_paths:
+        L += [
+            "## 🔴 Critical Attack Paths Found",
+            "",
+            "> **These endpoints are reachable without authentication AND the backing script",
+            "> contains code execution patterns. Treat as highest-priority for immediate",
+            "> remediation or network-level firewall isolation.**",
+            "",
+            "| Confidence | Unauthenticated Endpoint | Script | RCE Risk Flags |",
+            "|------------|--------------------------|--------|----------------|",
+        ]
+        for f in rce_paths:
+            ep_url     = f.line or "?"
+            script_name = Path(f.path).name
+            conf_m     = re.search(r'^\[(\w+)\]', f.detail)
+            confidence = conf_m.group(1) if conf_m else "?"
+            flags_m    = re.search(r'RCE-class flags: (.+)$', f.detail)
+            risk_flags = flags_m.group(1) if flags_m else "?"
+            L.append(
+                f"| **{confidence}** | `{ep_url}` | `{script_name}` | {risk_flags} |"
+            )
+        L += [""]
+        # Evidence sub-section (capped at 5)
+        L += ["### Evidence", ""]
+        for f in rce_paths[:5]:
+            ep_url = f.line or "?"
+            L += [
+                f"#### `{ep_url}` → `{Path(f.path).name}`",
+                "```",
+                (f.evidence or "")[:700],
+                "```",
+                "",
+            ]
+    L.append("")
 
     # ── Dangerous Functions ────────────────────────────────────────────────────
     df = findings_of("Dangerous Function", "Dangerous Function (binary)")
@@ -1584,14 +1709,14 @@ def build_markdown_report(findings, target, diff_data, compare):
         f"{n+3}. 🔵 Subscribe to Axis security advisories: https://www.axis.com/support/cybersecurity/security-advisories",
     ]
     L += steps
-    L += ["", "---", f"_Report generated by FirmSec v1.2 — {now}_"]
+    L += ["", "---", f"_Report generated by FirmSec v1.3 — {now}_"]
 
     return "\n".join(L)
 
 
 def build_json_report(findings, target, diff_data, compare):
     data = {
-        "tool": "FirmSec v1.2",
+        "tool": "FirmSec v1.3",
         "generated": datetime.now().isoformat(),
         "target": str(target),
         "compare": str(compare) if compare else None,
@@ -1651,7 +1776,7 @@ def print_terminal_summary(findings):
 def parse_args():
     parser = argparse.ArgumentParser(
         prog="firmsec",
-        description="FirmSec v1.2 — Axis OS Firmware Security Analyzer",
+        description="FirmSec v1.3 — Axis OS Firmware Security Analyzer",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
@@ -1681,13 +1806,13 @@ def main():
 
     if HAS_RICH:
         console.print(Panel.fit(
-            "[bold cyan]FirmSec v1.2[/bold cyan] — Axis OS Firmware Security Analyzer\n"
+            "[bold cyan]FirmSec v1.3[/bold cyan] — Axis OS Firmware Security Analyzer\n"
             "[dim]Optimized for Axis OS | Mac + Kali Linux[/dim]",
             border_style="cyan"
         ))
     else:
         print("=" * 60)
-        print("  FirmSec v1.2 — Axis OS Firmware Security Analyzer")
+        print("  FirmSec v1.3 — Axis OS Firmware Security Analyzer")
         print("=" * 60)
 
     if not target.exists():
