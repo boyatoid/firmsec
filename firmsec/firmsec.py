@@ -7,6 +7,7 @@ import argparse
 import json
 import os
 import re
+import stat
 import struct
 import subprocess
 import sys
@@ -92,66 +93,89 @@ CRED_FILE_EXTS = [
 ]
 
 # ── Vulnerable library signatures ─────────────────────────────────────────────
+#
+# Each CVE entry is a dict with:
+#   id       — CVE identifier
+#   desc     — short description
+#   fixed_in — first version where the vulnerability is fixed;
+#              None means the library is unmaintained and always vulnerable.
+#
+# Version comparison is done with _semver_lt() so that e.g. curl 8.19.0 is
+# correctly recognised as >= 8.4.0 and NOT flagged for CVE-2023-38545.
 
 VULNERABLE_LIBS = {
-    "openssl":  {
+    "openssl": {
         "pattern": r'(?:openssl|OpenSSL)[/ \-_v]*([\d]+\.[\d]+\.[\d]+[a-z]?)',
         "cves": [
-            "CVE-2014-0160 (Heartbleed, <1.0.1g)",
-            "CVE-2016-2107 (padding oracle, <1.0.1t/<1.0.2h)",
-            "CVE-2022-0778 (<1.0.2zd,<1.1.1n,<3.0.2)",
+            {"id": "CVE-2014-0160", "desc": "Heartbleed",              "fixed_in": "1.0.1g"},
+            {"id": "CVE-2016-2107", "desc": "padding oracle",          "fixed_in": "1.0.2h"},
+            {"id": "CVE-2022-0778", "desc": "infinite loop BN_mod_sqrt","fixed_in": "3.0.2"},
         ],
     },
     "libupnp": {
         "pattern": r'libupnp[/ \-_v]*([\d]+\.[\d]+\.[\d]+)',
         "cves": [
-            "CVE-2012-5958 (≤1.6.17 stack overflow)",
-            "CVE-2016-8863 (≤1.6.20 heap overflow)",
+            {"id": "CVE-2012-5958", "desc": "stack overflow",  "fixed_in": "1.6.18"},
+            {"id": "CVE-2016-8863", "desc": "heap overflow",   "fixed_in": "1.6.21"},
         ],
     },
     "boa": {
         "pattern": r'boa[/ \-_v]*([\d]+\.[\d]+\.[\d]+)',
         "cves": [
-            "CVE-2017-9833 (directory traversal)",
-            "CVE-2021-33558 (information disclosure)",
+            {"id": "CVE-2017-9833", "desc": "directory traversal",   "fixed_in": None},
+            {"id": "CVE-2021-33558","desc": "information disclosure", "fixed_in": None},
         ],
     },
     "thttpd": {
         "pattern": r'thttpd[/ \-_v]*([\d]+\.[\d]+\.[\d]+)',
         "cves": [
-            "CVE-2017-11549 (null pointer dereference)",
-            "CVE-2022-38723 (buffer overflow)",
+            {"id": "CVE-2017-11549","desc": "null pointer dereference","fixed_in": None},
+            {"id": "CVE-2022-38723","desc": "buffer overflow",         "fixed_in": None},
         ],
     },
     "busybox": {
         "pattern": r'[Bb]usyBox[/ \-_v]*([\d]+\.[\d]+\.[\d]+)',
         "cves": [
-            "CVE-2021-42374 (lzma OOB read)",
-            "CVE-2022-28391 (hush shell command injection)",
+            {"id": "CVE-2021-42374","desc": "lzma OOB read",             "fixed_in": "1.34.0"},
+            {"id": "CVE-2022-28391","desc": "hush shell command injection","fixed_in": "1.35.1"},
         ],
     },
     "curl": {
         "pattern": r'curl[/ \-_v]*([\d]+\.[\d]+\.[\d]+)',
-        "cves": ["CVE-2023-38545 (SOCKS5 heap overflow, <8.4.0)"],
+        "cves": [
+            {"id": "CVE-2023-38545","desc": "SOCKS5 heap overflow","fixed_in": "8.4.0"},
+        ],
     },
     "dropbear": {
         "pattern": r'[Dd]ropbear[/ \-_v]*([\d]+\.[\d]+)',
         "cves": [
-            "CVE-2016-7406 (format string via username, <2016.74)",
-            "CVE-2017-9078 (use-after-free, <2017.75)",
+            {"id": "CVE-2016-7406","desc": "format string via username","fixed_in": "2016.74"},
+            {"id": "CVE-2017-9078","desc": "use-after-free",            "fixed_in": "2017.75"},
         ],
     },
     "zlib": {
         "pattern": r'zlib[/ \-_v]*([\d]+\.[\d]+\.[\d]+)',
-        "cves": ["CVE-2022-37434 (heap buffer overflow via inflateGetHeader, <1.2.13)"],
+        "cves": [
+            {"id": "CVE-2022-37434","desc": "heap buffer overflow via inflateGetHeader","fixed_in": "1.2.13"},
+        ],
     },
 }
 
 # ── VAPIX / axis-cgi patterns ─────────────────────────────────────────────────
 
+# Endpoints that are intentionally public by Axis design — not a vulnerability.
+# These are excluded from unauthenticated-endpoint findings entirely.
+AXIS_PUBLIC_ENDPOINTS = {
+    "/axis-cgi/jpg/image.cgi",
+    "/axis-cgi/mjpg/video.cgi",
+    "/axis-cgi/media.cgi",
+    "/axis-cgi/audio/transmit.cgi",
+}
+
+# Historical patterns for endpoints that have been unauthenticated in older
+# Axis OS versions.  Used only as a fallback when no Apache config is found.
+# Severity is MEDIUM (requires live verification), not CRITICAL.
 VAPIX_UNAUTH_PATTERNS = [
-    r'/axis-cgi/jpg/image\.cgi',
-    r'/axis-cgi/mjpg/video\.cgi',
     r'/axis-cgi/operator/param\.cgi',
     r'/axis-cgi/admin/param\.cgi',
     r'/axis-cgi/io/port\.cgi',
@@ -163,6 +187,14 @@ VAPIX_UNAUTH_PATTERNS = [
     r'/axis-cgi/restart\.cgi',
     r'/axis-cgi/factorydefault\.cgi',
     r'/axis-cgi/basicdeviceinfo\.cgi',
+]
+
+# Custom Axis Apache auth modules — when present, auth is enforced at the
+# module level even if no AuthType/Require appears in a Location block.
+AXIS_AUTH_MODULES = [
+    "mod_authn_axisbasic",
+    "mod_authz_urlaccess",
+    "mod_authz_axisgroupfile",
 ]
 
 # Known default Axis credentials
@@ -493,27 +525,56 @@ def _build_rich_tree(node, path, depth, max_depth, max_entries, _c=[0]):
 
 # ── Finding class ─────────────────────────────────────────────────────────────
 
+def _semver_lt(version: str, fixed_in: str) -> bool:
+    """
+    Return True if version < fixed_in using numeric tuple comparison.
+    Strips trailing letters (e.g. "1.0.1g" → (1,0,1)) before comparing.
+    Returns False if either string cannot be parsed, erring on the side of
+    not raising a false-positive.
+    """
+    def _parse(v: str) -> tuple:
+        v = re.sub(r'[a-zA-Z]+$', '', v.strip())
+        parts = re.split(r'[.\-]', v)
+        nums = []
+        for p in parts:
+            if p.isdigit():
+                nums.append(int(p))
+            else:
+                break
+        return tuple(nums)
+    try:
+        v = _parse(version)
+        f = _parse(fixed_in)
+        return bool(v and f and v < f)
+    except Exception:
+        return False
+
+
+# ── Finding class ─────────────────────────────────────────────────────────────
+
 class Finding:
-    def __init__(self, category, severity, path, detail, line=None, evidence=None):
-        self.category = category
-        self.severity = severity
-        self.path = str(path)
-        self.detail = detail
-        self.line = line
-        self.evidence = evidence
+    def __init__(self, category, severity, path, detail,
+                 line=None, evidence=None, confidence="Medium"):
+        self.category   = category
+        self.severity   = severity
+        self.path       = str(path)
+        self.detail     = detail
+        self.line       = line
+        self.evidence   = evidence
+        self.confidence = confidence  # "High" | "Medium" | "Low"
 
     def sort_key(self):
         return SEVERITY_ORDER.get(self.severity, 99)
 
 # ── Step 2: Static Analysis ───────────────────────────────────────────────────
 
-def step_analyze(extract_dir: Path, kali: bool):
+def step_analyze(extract_dir: Path, kali: bool, extracted: bool = False):
     _sep()
     _info("STEP 2 — STATIC ANALYSIS")
     _sep()
 
     findings = []
-    findings += find_elf_binaries(extract_dir, kali)
+    findings += find_elf_binaries(extract_dir, kali, extracted=extracted)
     findings += grep_dangerous_functions(extract_dir)
     findings += find_credentials(extract_dir)
     findings += find_passwd_shadow(extract_dir)
@@ -531,7 +592,7 @@ def step_analyze(extract_dir: Path, kali: bool):
     return findings
 
 
-def find_elf_binaries(root: Path, kali: bool):
+def find_elf_binaries(root: Path, kali: bool, extracted: bool = False):
     _info("Scanning for ELF binaries and detecting architecture...")
     findings = []
     elf_files = []
@@ -558,17 +619,43 @@ def find_elf_binaries(root: Path, kali: bool):
     if elf_files:
         findings.append(Finding(
             "ELF Binaries", LOW, root,
-            f"{len(elf_files)} ELF binaries. Architectures: {arch_summary}"
+            f"{len(elf_files)} ELF binaries. Architectures: {arch_summary}",
+            confidence="High",
         ))
 
-    # Flag SUID binaries — privilege escalation vector
-    stdout, _, _ = run_cmd(f'find "{root}" -perm -4000 -type f 2>/dev/null')
-    for suid in stdout.strip().splitlines():
-        if suid.strip():
-            findings.append(Finding(
-                "SUID Binary", HIGH, suid.strip(),
-                "SUID bit set — potential privilege escalation; review if necessary"
-            ))
+    # SUID detection requires a properly extracted filesystem with preserved
+    # permissions.  Without --extracted the results are unreliable because
+    # binwalk without root drops setuid bits.
+    if extracted:
+        suid_found = []
+        for p in root.rglob("*"):
+            if not p.is_file() or p.is_symlink():
+                continue
+            try:
+                st = p.stat()
+                if st.st_mode & stat.S_ISUID:
+                    suid_found.append(p)
+            except (IOError, OSError):
+                continue
+        if suid_found:
+            for p in suid_found:
+                findings.append(Finding(
+                    "SUID Binary", HIGH, p,
+                    "SUID bit confirmed via stat() — potential privilege escalation; review if necessary",
+                    confidence="High",
+                ))
+        else:
+            _ok("SUID scan: no SUID binaries found (filesystem permissions preserved)")
+    else:
+        _warn("SUID detection skipped — run with --extracted for reliable SUID analysis")
+        findings.append(Finding(
+            "SUID Binary", LOW, root,
+            "SUID detection skipped. For accurate results extract the firmware filesystem "
+            "with preserved permissions, then re-run with --extracted:\n"
+            "  sudo unsquashfs -d ./squashfs-root <squashfs-image>\n"
+            "  python3 firmsec.py --target ./squashfs-root --extracted",
+            confidence="Low",
+        ))
 
     return findings
 
@@ -880,10 +967,11 @@ def get_vapix_auth_evidence(ep: str, ref_fpath: str, ref_lineno: str, root: Path
             except (IOError, OSError):
                 continue
 
-            # Detect bare (non-Location-wrapped) global AuthType
-            # Axis OS uses httpd-digest.conf / httpd-basic.conf at the top level.
-            bare_auth = re.search(r'(?m)^AuthType\s+\S+', conf_content)
-            if bare_auth and not re.search(r'<Location', conf_content, re.IGNORECASE):
+            # Detect bare (non-Location-wrapped) global AuthType, or Axis custom auth
+            # module references (mod_authn_axisbasic, mod_authz_urlaccess, etc.).
+            bare_auth        = re.search(r'(?m)^AuthType\s+\S+', conf_content)
+            has_axis_module  = any(mod in conf_content for mod in AXIS_AUTH_MODULES)
+            if (bare_auth or has_axis_module) and not re.search(r'<Location', conf_content, re.IGNORECASE):
                 global_auth_conf = conf_file.name
 
             # Scan <Location> and <LocationMatch> blocks
@@ -977,15 +1065,28 @@ def find_vapix_endpoints(root: Path):
             endpoint_refs[ep] = (fpath, lineno)
 
     for ep, (ref_fpath, ref_lineno) in endpoint_refs.items():
+        # Skip endpoints that are intentionally public on Axis devices
+        ep_base = ep.split("?")[0].rstrip("/")
+        if ep_base in AXIS_PUBLIC_ENDPOINTS:
+            continue
+
         evidence_snip, auth_label, hint = get_vapix_auth_evidence(
             ep, ref_fpath, ref_lineno, root
         )
         if hint == "auth":
-            severity = LOW
+            severity   = LOW
+            confidence = "High"
         elif hint == "unauth":
-            severity = CRITICAL
+            # Downgraded from CRITICAL — Axis custom auth modules may enforce auth at runtime
+            severity   = MEDIUM
+            confidence = "Medium"
+            auth_label += (
+                " — Requires live verification"
+                " (Axis custom auth modules may enforce authentication at runtime)"
+            )
         else:
-            severity = MEDIUM
+            severity   = MEDIUM
+            confidence = "Medium"
 
         ref_str = f"{Path(ref_fpath).name}:{ref_lineno}" if ref_fpath != "?" else "?"
         findings.append(Finding(
@@ -993,6 +1094,7 @@ def find_vapix_endpoints(root: Path):
             auth_label,
             line=ref_str,
             evidence=evidence_snip or None,
+            confidence=confidence,
         ))
 
     # Check for param → shell patterns near VAPIX handler code
@@ -1108,18 +1210,40 @@ def detect_vulnerable_libraries(root: Path):
     combined = "\n".join([elf_strings, lib_filenames, text_content])
 
     for lib_name, info in VULNERABLE_LIBS.items():
-        matches = re.findall(info["pattern"], combined, re.IGNORECASE)
+        pattern = info.get("pattern") or (
+            rf'(?:{re.escape(lib_name)})[/ \-_v]*([\d]+\.[\d]+\.[\d]+[a-zA-Z]?)'
+        )
+        matches = re.findall(pattern, combined, re.IGNORECASE)
         if matches:
             version = matches[0]
-            cve_list = "; ".join(info["cves"])
-            findings.append(Finding(
-                "Vulnerable Library", HIGH, root,
-                f"{lib_name} v{version} — CVEs: {cve_list}"
-            ))
+            applicable_cves = []
+            for cve in info["cves"]:
+                fixed_in = cve.get("fixed_in")
+                if fixed_in is None:
+                    applicable_cves.append(cve)   # no fix known → always flag
+                elif _semver_lt(version, fixed_in):
+                    applicable_cves.append(cve)   # version < fixed_in → affected
+
+            if applicable_cves:
+                cve_strs = "; ".join(
+                    cve["id"]
+                    + (f" ({cve['desc']})" if cve.get("desc") else "")
+                    + (f" [fixed in {cve['fixed_in']}]" if cve.get("fixed_in") else "")
+                    for cve in applicable_cves
+                )
+                findings.append(Finding(
+                    "Vulnerable Library", HIGH, root,
+                    f"{lib_name} v{version} — CVEs: {cve_strs}",
+                    confidence="High",
+                ))
+            # else: version detected and is >= fixed_in for all CVEs → not flagged
         elif re.search(rf'\b{re.escape(lib_name)}\b', combined, re.IGNORECASE):
+            first_cve = info["cves"][0]["id"]
             findings.append(Finding(
                 "Vulnerable Library", MEDIUM, root,
-                f"{lib_name} detected (version unclear) — check: {info['cves'][0]}"
+                f"{lib_name} detected (version unclear) — check: {first_cve}."
+                " Manual verification recommended.",
+                confidence="Low",
             ))
 
     _ok(f"Library scan: {len(findings)} findings")
@@ -1458,8 +1582,16 @@ def build_markdown_report(findings, target, diff_data, compare):
     ]
 
     # ── Executive Summary ──────────────────────────────────────────────────────
+    confirmed_f  = [f for f in findings if getattr(f, "confidence", "Medium") == "High"]
+    verify_f     = [f for f in findings if getattr(f, "confidence", "Medium") == "Medium"]
+    info_f       = [f for f in findings if getattr(f, "confidence", "Medium") == "Low"]
+    conf_crit    = sum(1 for f in confirmed_f if f.severity == CRITICAL)
+    conf_high    = sum(1 for f in confirmed_f if f.severity == HIGH)
+
     L += [
         "## Executive Summary",
+        "",
+        "### Severity Breakdown",
         "",
         "| Severity | Count |",
         "|----------|-------|",
@@ -1469,13 +1601,28 @@ def build_markdown_report(findings, target, diff_data, compare):
         f"| 🔵 Low      | {counts[LOW]} |",
         f"| **Total**   | **{sum(counts.values())}** |",
         "",
+        "### Confidence Tiers",
+        "",
+        "| Tier | Count | Description |",
+        "|------|-------|-------------|",
+        f"| ✅ Confirmed Findings   | {len(confirmed_f)} | High-confidence — statically verified |",
+        f"| ⚠️ Requires Verification | {len(verify_f)} | Medium-confidence — needs live device check |",
+        f"| ℹ️ Informational         | {len(info_f)} | Low-confidence — advisory / unclear version |",
+        "",
+        "> **Evidence Quality:** `High` = version or auth status verified from static analysis; "
+        "`Medium` = pattern-matched or requires runtime confirmation; "
+        "`Low` = library present but version ambiguous.",
+        "",
         f"**Firmware target:** `{Path(str(target)).name}`  ",
         f"**Target device:** Axis OS (camera / IoT device)  ",
         f"**Analysis date:** {now}  ",
         "",
     ]
-    if counts[CRITICAL] > 0:
-        L.append(f"> ⚠️ **{counts[CRITICAL]} CRITICAL findings require immediate attention.**")
+    if conf_crit > 0:
+        L.append(f"> ⚠️ **{conf_crit} CONFIRMED CRITICAL findings require immediate attention.**")
+        L.append("")
+    elif conf_high > 0:
+        L.append(f"> 🟠 **{conf_high} confirmed HIGH-severity findings detected.**")
         L.append("")
 
     # ── Critical Attack Paths (cross-reference) ────────────────────────────────
@@ -1556,11 +1703,12 @@ def build_markdown_report(findings, target, diff_data, compare):
     ve = findings_of("VAPIX Endpoint", "VAPIX Shell Risk", "VAPIX Shell Injection")
     L += ["## VAPIX Endpoints", ""]
     if ve:
-        L += ["| Severity | Endpoint / Location | Auth Status | Source Ref |",
-              "|----------|---------------------|-------------|------------|"]
+        L += ["| Severity | Confidence | Endpoint / Location | Auth Status | Source Ref |",
+              "|----------|------------|---------------------|-------------|------------|"]
         for f in ve:
-            ref = f.line or "—"
-            L.append(f"| {badge(f.severity)} {f.severity} | `{f.path}` | {f.detail} | `{ref}` |")
+            ref  = f.line or "—"
+            conf = getattr(f, "confidence", "Medium")
+            L.append(f"| {badge(f.severity)} {f.severity} | {conf} | `{f.path}` | {f.detail} | `{ref}` |")
         # Evidence snippets for unauthenticated / unknown endpoints
         evidence_items = [
             f for f in ve
@@ -1620,10 +1768,11 @@ def build_markdown_report(findings, target, diff_data, compare):
     vl = findings_of("Vulnerable Library")
     L += ["## Vulnerable Libraries", ""]
     if vl:
-        L += ["| Severity | Detail |",
-              "|----------|--------|"]
+        L += ["| Severity | Confidence | Detail |",
+              "|----------|------------|--------|"]
         for f in vl:
-            L.append(f"| {badge(f.severity)} {f.severity} | {f.detail} |")
+            conf = getattr(f, "confidence", "Medium")
+            L.append(f"| {badge(f.severity)} {f.severity} | {conf} | {f.detail} |")
     else:
         L.append("_No vulnerable library versions detected._")
     L.append("")
@@ -1794,8 +1943,15 @@ Examples:
                         help=f"Output directory (default: {default_reports})")
     parser.add_argument("--format",       default="markdown",  choices=["markdown", "json"],
                         help="Report format (default: markdown)")
-    parser.add_argument("--skip-extract", action="store_true", help="Skip binwalk; target is a directory")
-    parser.add_argument("--kali",         action="store_true", help="Kali Linux tool path hints")
+    parser.add_argument("--skip-extract",            action="store_true",
+                        help="Skip binwalk; target is a directory")
+    parser.add_argument("--extracted",               action="store_true",
+                        help="Target is extracted filesystem with preserved permissions"
+                             " (enables accurate SUID detection via stat())")
+    parser.add_argument("--skip-extraction-warning", action="store_true",
+                        help="Suppress the extraction guidance printed for raw firmware binaries")
+    parser.add_argument("--kali",                    action="store_true",
+                        help="Kali Linux tool path hints")
     return parser.parse_args()
 
 
@@ -1823,7 +1979,22 @@ def main():
     compare_path = None
 
     if target.is_file() and not args.skip_extract:
+        if not args.skip_extraction_warning:
+            print()
+            _info("Raw firmware binary detected. For full analysis (including SUID detection),")
+            _info("extract the SquashFS filesystem with preserved permissions first:")
+            print("  sudo apt install binwalk squashfs-tools")
+            print("  binwalk -e " + str(target))
+            print("  sudo unsquashfs -d ./squashfs-root <squashfs-image>")
+            print("  firmsec.py --target ./squashfs-root --skip-extract --extracted")
+            print("  (Use --skip-extraction-warning to suppress this message)")
+            print()
         extract_dir, fs_type = step_extract(target, args.kali)
+        # After extraction, report the deepest squashfs-root for user to target next time
+        sq_roots = sorted(extract_dir.rglob("squashfs-root"), key=lambda p: len(p.parts))
+        if sq_roots:
+            _info(f"Extracted SquashFS root: {sq_roots[-1]}")
+            _info("Re-run with --target <above path> --skip-extract --extracted for SUID detection")
     elif target.is_dir() or args.skip_extract:
         extract_dir = target
         fs_type = detect_filesystem(target)
@@ -1838,7 +2009,7 @@ def main():
         compare_extract = compare_path if compare_path.is_dir() else step_extract(compare_path, args.kali)[0]
         diff_data = step_diff(extract_dir, compare_extract)
 
-    findings = step_analyze(extract_dir, args.kali)
+    findings = step_analyze(extract_dir, args.kali, extracted=getattr(args, "extracted", False))
     print_terminal_summary(findings)
 
     report_path = generate_report(findings, target, output_dir, args.format, diff_data, compare_path)
