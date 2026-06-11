@@ -3,10 +3,10 @@
 import re
 from pathlib import Path
 
-from constants import CRITICAL, HIGH, MEDIUM, LOW
-from console import _info, _ok
-from finding import Finding
-from utils import run_cmd
+from .constants import CRITICAL, HIGH, MEDIUM, LOW
+from .console import _info, _ok
+from .finding import Finding
+from .utils import run_cmd
 
 
 def find_scripts(root: Path):

@@ -6,7 +6,7 @@ the print helpers (and the `console` / `HAS_RICH` handles) from this module.
 
 import sys
 
-from constants import CRITICAL, HIGH, MEDIUM, LOW
+from .constants import CRITICAL, HIGH, MEDIUM, LOW
 
 try:
     from colorama import Fore, Style, init as colorama_init

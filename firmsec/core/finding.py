@@ -1,6 +1,6 @@
 """The Finding model — one security observation produced by an analyzer."""
 
-from constants import SEVERITY_ORDER
+from .constants import SEVERITY_ORDER
 
 
 class Finding:

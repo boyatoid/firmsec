@@ -4,10 +4,10 @@ import argparse
 import sys
 from pathlib import Path
 
-from console import HAS_RICH, console, Panel, _ok, _info, _err, _sep
-from extract import step_extract, detect_filesystem, print_tree_summary
-from runner import step_analyze, step_diff
-from report import generate_report, print_terminal_summary
+from .console import HAS_RICH, console, Panel, _ok, _info, _err, _sep
+from .extract import step_extract, detect_filesystem, print_tree_summary
+from .runner import step_analyze, step_diff
+from .report import generate_report, print_terminal_summary
 
 
 def parse_args():
@@ -26,7 +26,8 @@ Examples:
     )
     parser.add_argument("--target",       required=True,       help="Firmware binary or pre-extracted directory")
     parser.add_argument("--compare",      default=None,        help="Second firmware for diff comparison")
-    default_reports = str(Path(__file__).parent / "reports")
+    # cli.py lives in firmsec/core/, so the reports dir is one level up.
+    default_reports = str(Path(__file__).resolve().parent.parent / "reports")
     parser.add_argument("--output",       default=default_reports,
                         help=f"Output directory (default: {default_reports})")
     parser.add_argument("--format",       default="markdown",  choices=["markdown", "json"],

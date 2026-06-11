@@ -5,14 +5,14 @@ import re
 from datetime import datetime
 from pathlib import Path
 
-from constants import (
+from .constants import (
     CRITICAL, HIGH, MEDIUM,
     CRED_PATTERNS, CRED_FILE_EXTS, AXIS_DEFAULT_CREDS,
 )
-from console import _info, _ok
-from finding import Finding
-from filters import credential_severity, is_false_positive, _is_credlike
-from utils import run_cmd
+from .console import _info, _ok
+from .finding import Finding
+from .filters import credential_severity, is_false_positive, _is_credlike
+from .utils import run_cmd
 
 
 def find_credentials(root: Path):

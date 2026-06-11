@@ -5,8 +5,8 @@ import struct
 import subprocess
 from pathlib import Path
 
-from constants import ELF_MACHINES
-from console import _warn
+from .constants import ELF_MACHINES
+from .console import _warn
 
 
 def check_tool(name, kali=False):

@@ -8,7 +8,7 @@ incidental grep matches that are not real secrets.
 import re
 from pathlib import Path
 
-from constants import (
+from .constants import (
     CRITICAL, HIGH,
     WEB_ACCESSIBLE_DIRS, ALWAYS_CRITICAL_LABELS, FALSE_POSITIVE_RULES,
 )

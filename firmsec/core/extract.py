@@ -3,8 +3,8 @@
 import sys
 from pathlib import Path
 
-from console import HAS_RICH, console, Tree, _ok, _info, _warn, _err, _sep
-from utils import check_tool, run_cmd
+from .console import HAS_RICH, console, Tree, _ok, _info, _warn, _err, _sep
+from .utils import check_tool, run_cmd
 
 
 def step_extract(target: Path, kali: bool):

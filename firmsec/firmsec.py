@@ -2,13 +2,13 @@
 """
 FirmSec - Firmware Security Analysis Tool for Axis OS Devices
 
-Entry-point shim. The implementation lives in flat sibling modules in this same
-directory (constants, console, utils, finding, filters, extract, analyzers_*,
-report, runner, cli). Running this file directly keeps working because the
-script's own directory is on sys.path, so those modules import cleanly.
+Entry-point shim. The implementation lives in the `core` package alongside this
+file (core/constants, core/console, core/cli, …). Running this file directly
+keeps working because the script's own directory is on sys.path, so `core` is
+importable.
 """
 
-from cli import main
+from core.cli import main
 
 if __name__ == "__main__":
     main()

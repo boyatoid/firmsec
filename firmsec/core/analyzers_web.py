@@ -5,13 +5,13 @@ unauthenticated-endpoint × RCE-script cross-reference."""
 import re
 from pathlib import Path
 
-from constants import (
+from .constants import (
     CRITICAL, HIGH, MEDIUM, LOW,
     AXIS_PUBLIC_ENDPOINTS, VAPIX_UNAUTH_PATTERNS, AXIS_AUTH_MODULES,
 )
-from console import _info, _ok
-from finding import Finding
-from utils import run_cmd
+from .console import _info, _ok
+from .finding import Finding
+from .utils import run_cmd
 
 
 def get_vapix_auth_evidence(ep: str, ref_fpath: str, ref_lineno: str, root: Path) -> tuple:

@@ -5,8 +5,8 @@ import json
 import re
 from pathlib import Path
 
-from constants import CRITICAL, HIGH, MEDIUM, LOW
-from console import HAS_RICH, console, Table, severity_color, _ok, _info, _sep
+from .constants import CRITICAL, HIGH, MEDIUM, LOW
+from .console import HAS_RICH, console, Table, severity_color, _ok, _info, _sep
 
 def count_by_severity(findings):
     counts = {CRITICAL: 0, HIGH: 0, MEDIUM: 0, LOW: 0}

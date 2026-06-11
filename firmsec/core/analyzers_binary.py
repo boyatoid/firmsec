@@ -6,13 +6,13 @@ import stat
 from collections import Counter
 from pathlib import Path
 
-from constants import (
+from .constants import (
     CRITICAL, HIGH, MEDIUM, LOW,
     DANGEROUS_FUNCTIONS, VULNERABLE_LIBS,
 )
-from console import _info, _ok, _warn
-from finding import Finding
-from utils import run_cmd, read_elf_arch, _semver_lt
+from .console import _info, _ok, _warn
+from .finding import Finding
+from .utils import run_cmd, read_elf_arch, _semver_lt
 
 
 def find_elf_binaries(root: Path, kali: bool, extracted: bool = False):

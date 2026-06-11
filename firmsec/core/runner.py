@@ -2,16 +2,16 @@
 
 from pathlib import Path
 
-from console import _ok, _info, _sep
-from utils import run_cmd
-from analyzers_binary import (
+from .console import _ok, _info, _sep
+from .utils import run_cmd
+from .analyzers_binary import (
     find_elf_binaries, grep_dangerous_functions, detect_vulnerable_libraries,
 )
-from analyzers_creds import (
+from .analyzers_creds import (
     find_credentials, find_passwd_shadow, find_keys_and_certs,
 )
-from analyzers_scripts import find_scripts, find_init_scripts
-from analyzers_web import (
+from .analyzers_scripts import find_scripts, find_init_scripts
+from .analyzers_web import (
     find_vapix_endpoints, analyze_webserver_configs, find_network_services,
     axis_specific_checks, cross_reference_unauth_rce,
 )
